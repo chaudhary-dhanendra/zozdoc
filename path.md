@@ -622,7 +622,152 @@ enum Permission {
     AdminWrite,
 }
 State Machine: Session:
+Purpose: Define the deterministic lifecycle of a client connection from authentication through expiry, logout, lockout, or revocation propagation.
+State definitions:
+•	Anonymous: connection exists but no credentials have been accepted.
+•	Authenticating: credentials are being verified and replay protection is checked.
+•	Active: session is authenticated, unexpired, and authorized requests may be processed.
+•	RateLimited: session remains authenticated but requests are temporarily rejected by rate policy.
+•	Suspended: session is blocked by security, compliance, or administrative action.
+•	Expired: session lifetime elapsed and credentials must be re-presented.
+•	Terminated: logout, disconnect cleanup, or administrative termination completed.
+Valid transitions:
+•	Anonymous -> Authenticating on CredentialsSubmitted.
+•	Authenticating -> Active on AuthenticationSucceeded.
+•	Authenticating -> Anonymous on AuthenticationFailed with retry budget remaining.
+•	Authenticating -> Suspended on AuthenticationFailed when lockout threshold is reached.
+•	Active -> RateLimited on RateLimitExceeded.
+•	RateLimited -> Active on RateLimitWindowReset.
+•	Active -> Suspended on SecurityLockoutApplied, PermissionRevoked, or ApiKeyRevoked.
+•	Suspended -> Active on SecurityLockoutCleared.
+•	Active -> Expired on SessionTtlElapsed.
+•	Active -> Terminated on LogoutRequested or ConnectionClosed.
+Invalid transitions:
+•	Anonymous -> Active without AuthenticationSucceeded is forbidden.
+•	Expired -> Active without a new authentication flow is forbidden.
+•	Terminated -> Active is forbidden; a new session_id is required.
+•	RateLimited -> Terminated by timer alone is forbidden.
+Failure transitions:
+•	Authenticating -> Anonymous on bad credentials below lockout threshold.
+•	Authenticating -> Suspended on credential stuffing, replay, or lockout threshold.
+•	Active -> Suspended on permission revocation, API key revocation, impossible travel, or signature replay.
+•	Active -> Terminated on unrecoverable session-store corruption after audit event persistence.
+Recovery behaviour:
+•	Expired and Terminated sessions are never recovered in-place.
+•	Suspended sessions recover only after the authoritative security decision is cleared and permissions are reloaded.
+•	RateLimited sessions recover automatically when the relevant bucket or window resets.
+•	On gateway failover, Active sessions are reconstructed from signed session records and latest revocation watermark.
+Events emitted:
+•	SessionAuthenticationStarted
+•	SessionAuthenticated
+•	SessionAuthenticationFailed
+•	SessionRateLimited
+•	SessionRateLimitCleared
+•	SessionSuspended
+•	SessionResumed
+•	SessionExpired
+•	SessionTerminated
+```mermaid
+stateDiagram-v2
+    [*] --> Anonymous
+    Anonymous --> Authenticating: CredentialsSubmitted
+    Authenticating --> Active: AuthenticationSucceeded
+    Authenticating --> Anonymous: AuthenticationFailed / retriesRemaining
+    Authenticating --> Suspended: AuthenticationFailed / lockoutThresholdReached
+    Active --> RateLimited: RateLimitExceeded
+    RateLimited --> Active: RateLimitWindowReset
+    Active --> Suspended: SecurityLockoutApplied\nPermissionRevoked\nApiKeyRevoked
+    Suspended --> Active: SecurityLockoutCleared
+    Active --> Expired: SessionTtlElapsed
+    Active --> Terminated: LogoutRequested\nConnectionClosed
+    Suspended --> Terminated: AdminTerminateSession
+    Expired --> [*]
+    Terminated --> [*]
+```
+Test cases:
+•	Authenticate with valid credentials and assert Anonymous -> Authenticating -> Active.
+•	Submit invalid credentials below retry threshold and assert return to Anonymous with failure audit.
+•	Exceed retry threshold and assert Suspended with no request forwarding.
+•	Exceed rate limit and assert RateLimited rejects requests until reset.
+•	Revoke the backing API key and assert next validation transitions Active -> Suspended.
+Acceptance criteria:
+•	Requests are accepted only when the session is Active and permissions are current.
+•	Terminal states cannot transition back to Active with the same session_id.
+•	Transitions are idempotent under duplicate gateway messages.
+•	Failure transitions emit auditable events before client-visible errors are returned.
+
 State Machine: API Key:
+Purpose: Define the lifecycle of programmatic credentials from creation through activation, rotation, suspension, expiry, and revocation.
+State definitions:
+•	Draft: key metadata is being assembled and has not been issued.
+•	Active: key can authenticate requests within configured permissions, expiry, and IP policy.
+•	Rotating: replacement credentials have been generated and overlap rules are active.
+•	Suspended: key is temporarily disabled by risk, compliance, or admin action.
+•	Expired: key is past expires_at and must not authenticate.
+•	Revoked: key is permanently disabled and secrets must be unusable.
+Valid transitions:
+•	Draft -> Active on KeyIssued.
+•	Active -> Rotating on RotationRequested.
+•	Rotating -> Active on RotationCompleted.
+•	Active -> Suspended on AdminSuspendKey or RiskSuspendKey.
+•	Suspended -> Active on AdminResumeKey.
+•	Active or Rotating -> Expired on ExpiryReached.
+•	Active, Suspended, or Expired -> Revoked on KeyRevoked.
+Invalid transitions:
+•	Revoked -> Active, Revoked -> Rotating, and Expired -> Active are forbidden.
+•	Draft -> Rotating is forbidden because unissued keys have no live secret.
+•	Suspended -> Rotating is forbidden until suspension is cleared.
+•	Active -> Draft is forbidden because issuance is immutable.
+Failure transitions:
+•	Draft -> Revoked on SecretMaterializationFailed after secure erase.
+•	Rotating -> Suspended on RotationIntegrityCheckFailed.
+•	Active -> Suspended on SignatureReplayDetected, IpWhitelistViolation, or permissions mismatch.
+•	Any non-terminal state -> Revoked on CompromiseConfirmed.
+Recovery behaviour:
+•	Suspended keys recover only through maker-checker approval and permission revalidation.
+•	Failed rotation resumes the previous secret only if compromise is not suspected; otherwise revoke.
+•	Expired keys are not recovered; create a new key.
+•	Revoked keys are never recovered and remain on revocation lists until all caches pass the revocation watermark.
+Events emitted:
+•	ApiKeyDraftCreated
+•	ApiKeyIssued
+•	ApiKeyRotationRequested
+•	ApiKeyRotated
+•	ApiKeySuspended
+•	ApiKeyResumed
+•	ApiKeyExpired
+•	ApiKeyRevoked
+•	ApiKeyAuthenticationRejected
+```mermaid
+stateDiagram-v2
+    [*] --> Draft
+    Draft --> Active: KeyIssued
+    Draft --> Revoked: SecretMaterializationFailed
+    Active --> Rotating: RotationRequested
+    Rotating --> Active: RotationCompleted
+    Rotating --> Suspended: RotationIntegrityCheckFailed
+    Active --> Suspended: AdminSuspendKey\nRiskSuspendKey\nSignatureReplayDetected
+    Suspended --> Active: AdminResumeKey
+    Active --> Expired: ExpiryReached
+    Rotating --> Expired: ExpiryReached
+    Active --> Revoked: KeyRevoked\nCompromiseConfirmed
+    Suspended --> Revoked: KeyRevoked\nCompromiseConfirmed
+    Expired --> Revoked: KeyRevoked
+    Expired --> [*]
+    Revoked --> [*]
+```
+Test cases:
+•	Issue a key and assert it authenticates only within scoped permissions and IP whitelist.
+•	Rotate a key and assert old and new credentials follow overlap rules.
+•	Suspend a key and assert authentication fails without deleting metadata.
+•	Expire a key and assert it cannot be resumed.
+•	Revoke a key and assert cache invalidation propagates before success is reported.
+Acceptance criteria:
+•	Revoked and expired keys cannot authenticate under any gateway cache state.
+•	Permission scope never exceeds the owning user permissions.
+•	Rotation is atomic from the client perspective and auditable.
+•	Secret values are never emitted in events, logs, or state projections.
+
 Business Rules:
 1.	API keys must be created with explicit permissions.
 2.	API key permissions cannot exceed user permissions.
@@ -768,7 +913,86 @@ struct ClearingDelta {
     hold_release: QtyI64,
     hold_consume: QtyI64,
 }
-State Machine: Order:
+State Machine: Order Lifecycle:
+Purpose: Define deterministic order progression from client acceptance through matching, resting, cancellation, expiry, rejection, or full execution.
+State definitions:
+•	Received: lifecycle state.
+•	Validating: lifecycle state.
+•	Rejected: lifecycle state.
+•	Accepted: lifecycle state.
+•	Resting: lifecycle state.
+•	PartiallyFilled: lifecycle state.
+•	Filled: lifecycle state.
+•	CancelPending: lifecycle state.
+•	Cancelled: lifecycle state.
+•	Expired: lifecycle state.
+Valid transitions:
+•	Received -> Validating on OrderReceived.
+•	Validating -> Accepted on ValidationPassed and RiskReserved.
+•	Validating -> Rejected on ValidationFailed or RiskRejected.
+•	Accepted -> Filled, PartiallyFilled, or Resting according to execution result.
+•	Resting or PartiallyFilled -> CancelPending on CancelRequested.
+•	CancelPending -> Cancelled or Filled according to Book Core sequence order.
+•	Resting or PartiallyFilled -> Expired on TimeInForceExpired.
+Invalid transitions:
+•	Terminal Rejected, Filled, Cancelled, and Expired states cannot return to active states.
+•	Received -> Resting without validation and risk reservation is forbidden.
+•	Filled -> CancelPending and Cancelled -> PartiallyFilled are forbidden.
+Failure transitions:
+•	Validating -> Rejected on malformed order, halted instrument, insufficient funds, self-trade rejection, or risk limit breach.
+•	Resting -> Cancelled on instrument halt cancel policy or account suspension.
+•	CancelPending -> Filled when a final fill is sequenced before the cancel.
+Recovery behaviour:
+•	Rebuild order state exclusively from EngineEvent sequence.
+•	Duplicate client_order_id returns the existing state without creating a second order.
+•	After Book Core failover, replay accepted, trade, cancel, and expiry events.
+•	Lost gateway responses recover through get_order_status.
+Events emitted:
+•	OrderReceived
+•	OrderValidationPassed
+•	OrderRejected
+•	OrderAccepted
+•	OrderRested
+•	TradeExecuted
+•	OrderPartiallyFilled
+•	OrderFilled
+•	OrderCancelRequested
+•	OrderCancelled
+•	OrderExpired
+```mermaid
+stateDiagram-v2
+    [*] --> Received
+    Received --> Validating: OrderReceived
+    Validating --> Accepted: ValidationPassed\nRiskReserved
+    Validating --> Rejected: ValidationFailed\nRiskRejected
+    Accepted --> Filled: FullImmediateFill
+    Accepted --> PartiallyFilled: PartialImmediateFill
+    Accepted --> Resting: PostedToBook
+    Resting --> PartiallyFilled: TradeExecuted
+    PartiallyFilled --> PartiallyFilled: TradeExecuted / openQtyRemains
+    PartiallyFilled --> Filled: TradeExecuted / openQtyZero
+    Resting --> CancelPending: CancelRequested
+    PartiallyFilled --> CancelPending: CancelRequested
+    CancelPending --> Cancelled: CancelSequenced
+    CancelPending --> Filled: TradeSequencedFirst
+    Resting --> Expired: TimeInForceExpired
+    PartiallyFilled --> Expired: TimeInForceExpired
+    Rejected --> [*]
+    Filled --> [*]
+    Cancelled --> [*]
+    Expired --> [*]
+```
+Test cases:
+•	Valid limit order rests.
+•	Marketable order fills or partially fills based on liquidity.
+•	Invalid tick size rejects with no hold.
+•	Cancel releases remaining hold exactly once.
+•	Cancel/fill race resolves by sequence order.
+Acceptance criteria:
+•	Every transition is represented by a sequenced engine event.
+•	Terminal states are immutable and idempotent.
+•	Open quantity, holds, fees, and fills reconcile to the event stream.
+•	Cancel and fill races resolve solely by Book Core sequence order.
 Business Rules:
 1.	Orders must have valid instrument, side, price (if limit), and quantity.
 2.	Price must respect tick size.
@@ -1064,6 +1288,79 @@ enum WithdrawalStatus {
     Cancelled,
 }
 State Machine: Withdrawal:
+Purpose: Define the controlled withdrawal lifecycle from user request through authorization, compliance review, wallet execution, completion, cancellation, or failure.
+State definitions:
+•	Requested: lifecycle state.
+•	Verifying: lifecycle state.
+•	SecurityReview: lifecycle state.
+•	Approved: lifecycle state.
+•	Processing: lifecycle state.
+•	Broadcast: lifecycle state.
+•	Completed: lifecycle state.
+•	Failed: lifecycle state.
+•	Cancelled: lifecycle state.
+Valid transitions:
+•	Requested -> Verifying on WithdrawalCreated.
+•	Verifying -> Approved, SecurityReview, or Failed based on checks.
+•	SecurityReview -> Approved or Cancelled by review decision.
+•	Approved -> Processing on WalletDispatchStarted or Cancelled before dispatch.
+•	Processing -> Broadcast on TransactionBroadcast or Failed on signer/broadcast failure.
+•	Broadcast -> Completed on confirmations or Failed after final chain failure.
+Invalid transitions:
+•	Completed -> Cancelled or Failed is forbidden.
+•	Cancelled -> Processing is forbidden.
+•	Requested -> Processing without verification and approval is forbidden.
+Failure transitions:
+•	Verifying -> Failed on insufficient balance, 2FA failure, sanctions hit, or limit breach.
+•	Approved -> Failed on hot-wallet liquidity timeout.
+•	Processing -> Failed on signer quorum failure or policy rejection.
+Recovery behaviour:
+•	Pre-broadcast Failed or Cancelled releases holds exactly once.
+•	Processing retries use the same withdrawal_id until broadcast.
+•	Broadcast recovery polls chain state and completes if confirmations are observed.
+•	Post-broadcast failure requires reconciliation workflow.
+Events emitted:
+•	WithdrawalCreated
+•	WithdrawalVerificationPassed
+•	WithdrawalVerificationFailed
+•	WithdrawalReviewRequired
+•	WithdrawalApproved
+•	WithdrawalRejected
+•	WithdrawalProcessingStarted
+•	WithdrawalBroadcast
+•	WithdrawalCompleted
+•	WithdrawalFailed
+•	WithdrawalCancelled
+```mermaid
+stateDiagram-v2
+    [*] --> Requested
+    Requested --> Verifying: WithdrawalCreated
+    Verifying --> Approved: VerificationPassed
+    Verifying --> SecurityReview: ReviewRequired\nNewAddressHold\nAmlReview
+    Verifying --> Failed: VerificationFailed\nLimitBreached
+    SecurityReview --> Approved: ReviewApproved
+    SecurityReview --> Cancelled: ReviewRejected\nUserCancel
+    Approved --> Processing: WalletDispatchStarted
+    Approved --> Cancelled: UserCancel
+    Processing --> Broadcast: TransactionBroadcast
+    Processing --> Failed: SigningFailed\nBroadcastFailed
+    Broadcast --> Completed: ConfirmationsReached
+    Broadcast --> Failed: ChainReorgFinalFailure\nTransactionDropped
+    Completed --> [*]
+    Failed --> [*]
+    Cancelled --> [*]
+```
+Test cases:
+•	Valid withdrawal locks funds through approval.
+•	New-address hold enters SecurityReview.
+•	2FA failure prevents wallet dispatch.
+•	Cancel before dispatch releases funds once.
+•	Missed chain callback recovers by polling.
+Acceptance criteria:
+•	No withdrawal reaches Processing without verification, approval, and locked funds.
+•	Funds are released exactly once for pre-broadcast failures or cancellations.
+•	Completed withdrawals have immutable tx_hash and balanced ledger entries.
+•	Manual decisions include maker-checker audit metadata.
 Business Rules:
 1.	Withdrawals require 2FA verification.
 2.	Withdrawals to new addresses have a 24-hour hold.
@@ -1343,6 +1640,83 @@ struct FuturesPosition {
     liquidation_price: PriceI64,
 }
 State Machine: Futures Position:
+Purpose: Define lifecycle and risk state of user futures exposure from flat through open, adjusted, margin-stressed, liquidation, and closure.
+State definitions:
+•	Flat: no open size exists.
+•	Opening: trade is creating exposure and margin is being bound.
+•	Open: non-zero size satisfies margin requirements.
+•	Increasing: execution increases absolute size.
+•	Reducing: execution decreases absolute size.
+•	MarginCall: margin ratio is below warning threshold.
+•	LiquidationPending: maintenance breach is queued.
+•	Liquidating: liquidation is executing.
+•	Closed: size is zero and realized PnL is finalized.
+Valid transitions:
+•	Flat -> Opening on opening trade.
+•	Opening -> Open when margin is bound.
+•	Open -> Increasing or Reducing on trades.
+•	Increasing -> Open after revaluation.
+•	Reducing -> Open or Closed based on remaining size.
+•	Open -> MarginCall on warning threshold.
+•	MarginCall -> Open on collateral or mark recovery.
+•	Open or MarginCall -> LiquidationPending on maintenance breach.
+•	LiquidationPending -> Liquidating -> Open or Closed.
+Invalid transitions:
+•	Flat -> Liquidating without a position is forbidden.
+•	Closed -> Open with same position_id is forbidden.
+•	MarginCall -> Increasing without restoring margin is forbidden.
+•	Liquidating -> Increasing is forbidden.
+Failure transitions:
+•	Opening -> Closed on trade bust or margin binding failure.
+•	Increasing -> LiquidationPending on adverse mark movement.
+•	Liquidating -> Closed with bankruptcy flag when collateral is exhausted.
+Recovery behaviour:
+•	Reconstruct from trades, funding, collateral, and mark-price events.
+•	Recompute missed margin alerts on every mark update.
+•	Resume LiquidationPending with position version fencing.
+•	Closed positions are immutable except correction events.
+Events emitted:
+•	FuturesPositionOpening
+•	FuturesPositionOpened
+•	FuturesPositionIncreased
+•	FuturesPositionReduced
+•	FuturesPositionMarginCall
+•	FuturesPositionMarginRestored
+•	FuturesPositionLiquidationPending
+•	FuturesPositionLiquidating
+•	FuturesPositionClosed
+•	FuturesPositionBankrupt
+```mermaid
+stateDiagram-v2
+    [*] --> Flat
+    Flat --> Opening: OpeningTradeExecuted
+    Opening --> Open: MarginBound
+    Opening --> Closed: MarginBindingFailed
+    Open --> Increasing: IncreaseTradeExecuted
+    Increasing --> Open: PositionRevalued
+    Open --> Reducing: ReduceTradeExecuted
+    Reducing --> Open: RemainingSizeNonZero
+    Reducing --> Closed: SizeZero
+    Open --> MarginCall: MarginRatioWarning
+    MarginCall --> Open: CollateralAdded\nMarkRecovered
+    Open --> LiquidationPending: MaintenanceMarginBreached
+    MarginCall --> LiquidationPending: MaintenanceMarginBreached
+    LiquidationPending --> Liquidating: LiquidationAccepted
+    Liquidating --> Open: PartialLiquidationRestoredMargin
+    Liquidating --> Closed: FullLiquidation\nBankruptcyResolved
+    Closed --> [*]
+```
+Test cases:
+•	Opening trade reaches Open with margin bound.
+•	Increase/reduce updates size, entry, and PnL.
+•	Collateral during MarginCall restores Open.
+•	Maintenance breach enters liquidation with version fencing.
+•	User full close reaches Closed.
+Acceptance criteria:
+•	Mark price drives margin and liquidation transitions.
+•	State is deterministic under event replay.
+•	Liquidation cannot be bypassed after sequenced breach unless margin restoration precedes it.
+•	Closed positions have zero open size and finalized realized PnL.
 Business Rules:
 1.	Mark price is used for PnL and liquidation, not last trade price.
 2.	Funding rate is calculated every 8 hours.
@@ -1467,7 +1841,83 @@ enum OptionStrategy {
     IronCondor,
     Custom,
 }
-State Machine: Option:
+State Machine: Option Lifecycle:
+Purpose: Define the lifecycle of an option contract from listing through trading, exercise or expiry, and final settlement.
+State definitions:
+•	Draft: contract parameters are being configured.
+•	Listed: contract is published but trading is not open.
+•	Trading: orders may be accepted.
+•	Halted: trading is temporarily stopped.
+•	ExercisePending: exercise or auto-exercise determination has started.
+•	Exercised: holder rights were exercised.
+•	Expired: expiry reached and no trading is allowed.
+•	Settled: cash or physical settlement is complete.
+•	Delisted: contract is removed from active catalogs.
+Valid transitions:
+•	Draft -> Listed on listing approval.
+•	Listed -> Trading on open.
+•	Trading <-> Halted by halt/resume.
+•	Trading or Halted -> ExercisePending on request or expiry.
+•	ExercisePending -> Exercised for accepted/ITM exercise.
+•	ExercisePending -> Expired for rejected/OTM/cutoff breach.
+•	Exercised or Expired -> Settled.
+•	Settled -> Delisted after retention.
+Invalid transitions:
+•	Draft -> Trading without Listed is forbidden.
+•	Trading -> Settled without exercise or expiry is forbidden.
+•	Expired -> Trading is forbidden.
+•	Delisted -> Trading is forbidden.
+Failure transitions:
+•	Draft -> Delisted on withdrawn invalid specification.
+•	Listed -> Halted on configuration failure.
+•	ExercisePending -> Expired on insufficient underlying or cutoff breach.
+•	Settlement failure remains in Exercised pending retry.
+Recovery behaviour:
+•	Expiry scheduler is idempotent and recomputes from final settlement price.
+•	Halted contracts resume only after admin approval and risk recalculation.
+•	Settlement retries preserve exercise_id and cannot duplicate postings.
+•	Delisted contracts remain queryable historically.
+Events emitted:
+•	OptionDraftCreated
+•	OptionListed
+•	OptionTradingOpened
+•	OptionTradingHalted
+•	OptionTradingResumed
+•	OptionExerciseRequested
+•	OptionAutoExerciseEvaluated
+•	OptionExercised
+•	OptionExpired
+•	OptionSettled
+•	OptionDelisted
+```mermaid
+stateDiagram-v2
+    [*] --> Draft
+    Draft --> Listed: OptionListed
+    Draft --> Delisted: SpecificationWithdrawn
+    Listed --> Trading: TradingOpened
+    Listed --> Halted: ConfigurationFailure
+    Trading --> Halted: TradingHalted
+    Halted --> Trading: TradingResumed
+    Trading --> ExercisePending: ExerciseRequested\nExpiryReached
+    Halted --> ExercisePending: ExpiryReached
+    ExercisePending --> Exercised: ExerciseAccepted\nAutoExerciseITM
+    ExercisePending --> Expired: ExerciseRejected\nOTMAtExpiry
+    Exercised --> Settled: SettlementCompleted
+    Expired --> Settled: ExpirySettlementCompleted
+    Settled --> Delisted: RetentionWindowElapsed
+    Delisted --> [*]
+```
+Test cases:
+•	List and open only after configured open time.
+•	Halt blocks new orders.
+•	Exercise ITM option and settle.
+•	Expire OTM option and settle.
+•	Retry settlement without duplicate movement.
+Acceptance criteria:
+•	No trading before open or after expiry/delist.
+•	Exercise decisions are deterministic from style, cutoff, position, and settlement price.
+•	Settlement is exactly-once at ledger level.
+•	Historical records remain available after Delisted.
 Business Rules:
 1.	Options must have valid strikes and expiries.
 2.	Pricing must use the appropriate model (Black-Scholes).
@@ -1605,6 +2055,88 @@ struct ADLEvent {
     timestamp: Timestamp,
 }
 State Machine: Liquidation:
+Purpose: Define liquidation progression from margin breach detection through execution, insurance fund use, ADL escalation, and final resolution.
+State definitions:
+•	Detected: maintenance breach identified.
+•	Pending: event persisted and position lock requested.
+•	Processing: liquidation orders or takeover executing.
+•	PartiallyFilled: some quantity closed.
+•	Completed: exposure closed or margin restored.
+•	Bankrupt: losses exceed collateral.
+•	InsuranceFundClaim: deficit coverage is being applied.
+•	ADLPending: auto-deleveraging is queued.
+•	ADLProcessing: counterparty deleveraging executing.
+•	Failed: operator intervention required.
+Valid transitions:
+•	Detected -> Pending on event creation.
+•	Pending -> Processing on position lock.
+•	Processing -> PartiallyFilled or Completed on executions.
+•	PartiallyFilled -> Processing or Completed based on residual risk.
+•	Processing -> Bankrupt on bankruptcy price.
+•	Bankrupt -> InsuranceFundClaim.
+•	InsuranceFundClaim -> Completed or ADLPending.
+•	ADLPending -> ADLProcessing -> Completed.
+Invalid transitions:
+•	Completed -> Processing is forbidden.
+•	Detected -> Completed without event and position lock is forbidden.
+•	ADLPending -> Completed without ADL or insurance coverage is forbidden.
+•	Failed -> Processing requires operator recovery and new lock version.
+Failure transitions:
+•	Pending -> Failed on lock failure.
+•	Processing -> Failed on engine unavailable or order rejection after fallback exhaustion.
+•	InsuranceFundClaim -> Failed on accounting inconsistency.
+•	ADLProcessing -> Failed on invariant violation.
+Recovery behaviour:
+•	Resume from persisted liquidation_id and locked position version.
+•	Recompute residual quantity and margin from executions before continuing.
+•	Insurance claims use deficit_id to prevent duplicate debits.
+•	Failed requires operator recovery or manual settlement.
+Events emitted:
+•	LiquidationDetected
+•	LiquidationPending
+•	LiquidationProcessingStarted
+•	LiquidationPartialFill
+•	LiquidationCompleted
+•	LiquidationBankrupt
+•	InsuranceFundClaimed
+•	InsuranceFundCoverCompleted
+•	ADLPending
+•	ADLProcessingStarted
+•	ADLCompleted
+•	LiquidationFailed
+```mermaid
+stateDiagram-v2
+    [*] --> Detected
+    Detected --> Pending: LiquidationEventCreated
+    Pending --> Processing: PositionLocked
+    Pending --> Failed: PositionLockFailed
+    Processing --> PartiallyFilled: PartialCloseExecuted
+    PartiallyFilled --> Processing: ContinueLiquidation
+    PartiallyFilled --> Completed: MarginRestored
+    Processing --> Completed: FullCloseExecuted
+    Processing --> Bankrupt: BankruptcyPriceCrossed
+    Processing --> Failed: EngineUnavailable\nOrderRejected
+    Bankrupt --> InsuranceFundClaim: DeficitCalculated
+    InsuranceFundClaim --> Completed: InsuranceFundCovered
+    InsuranceFundClaim --> ADLPending: InsuranceFundInsufficient
+    InsuranceFundClaim --> Failed: FundAccountingInconsistent
+    ADLPending --> ADLProcessing: ADLQueueSelected
+    ADLProcessing --> Completed: ADLCompleted
+    ADLProcessing --> Failed: ADLInvariantViolation
+    Completed --> [*]
+    Failed --> [*]
+```
+Test cases:
+•	Maintenance breach locks position before orders.
+•	Partial liquidation completes when margin restored.
+•	Bankruptcy uses insurance fund when sufficient.
+•	Depleted fund triggers ADL.
+•	Failover during Processing resumes by liquidation_id.
+Acceptance criteria:
+•	Decisions use mark price and maintenance margin breach events.
+•	Position locking prevents user-initiated increases.
+•	Deficits are covered exactly once by insurance fund or ADL.
+•	Terminal states reconcile position, ledger, and insurance projections.
 Business Rules:
 1.	Liquidation is triggered when maintenance margin is breached.
 2.	Partial liquidation may be used for large positions.
@@ -1872,6 +2404,85 @@ struct Config {
     updated_by: UserId,
 }
 State Machine: Instrument:
+Purpose: Define administrative and market-control lifecycle of a tradable instrument from configuration through activation, halt, suspension, retirement, and delisting.
+State definitions:
+•	Draft: definition is being prepared.
+•	PendingApproval: maker-checker approval is required.
+•	Configured: static parameters, risk limits, fees, and market identifiers are valid.
+•	Active: trading, market data, and risk checks are enabled.
+•	Halted: trading is temporarily stopped.
+•	Suspended: instrument is disabled due to incident, compliance, or risk.
+•	SettlementOnly: new orders blocked; reductions and settlement allowed.
+•	Retired: no longer tradable but queryable.
+•	Delisted: removed from active catalogs.
+Valid transitions:
+•	Draft -> PendingApproval on submission.
+•	PendingApproval -> Configured on approval or Draft on rejection.
+•	Configured -> Active on activation.
+•	Active -> Halted and Halted -> Active by halt/resume.
+•	Active or Halted -> Suspended by incident escalation.
+•	Suspended -> Halted for staged recovery.
+•	Active or Halted -> SettlementOnly on retirement.
+•	SettlementOnly -> Retired when open interest and orders are zero.
+•	Retired -> Delisted after retention.
+Invalid transitions:
+•	Draft -> Active without approval is forbidden.
+•	Delisted -> Active is forbidden without new instrument_id or migration.
+•	Retired -> Halted is forbidden.
+•	Suspended -> Active without incident closure and approval is forbidden.
+Failure transitions:
+•	PendingApproval -> Draft on validation failure.
+•	Configured -> Suspended on propagation failure after activation attempt.
+•	Active -> Halted on market data failure, price band breach, matching incident, or admin halt.
+•	Any non-terminal state -> Suspended on compliance prohibition.
+Recovery behaviour:
+•	Halted resumes after book, risk, and market data health checks.
+•	Suspended requires incident closure and maker-checker approval.
+•	SettlementOnly permits only risk-reducing actions until obligations are zero.
+•	Delisted remains available to audit, ledger, and historical projections.
+Events emitted:
+•	InstrumentDraftCreated
+•	InstrumentSubmittedForApproval
+•	InstrumentApproved
+•	InstrumentRejected
+•	InstrumentConfigured
+•	InstrumentActivated
+•	InstrumentHalted
+•	InstrumentResumed
+•	InstrumentSuspended
+•	InstrumentSettlementOnly
+•	InstrumentRetired
+•	InstrumentDelisted
+```mermaid
+stateDiagram-v2
+    [*] --> Draft
+    Draft --> PendingApproval: SubmitForApproval
+    PendingApproval --> Configured: ApprovalGranted
+    PendingApproval --> Draft: ApprovalRejected\nValidationFailed
+    Configured --> Active: ActivateInstrument
+    Configured --> Suspended: PropagationFailure
+    Active --> Halted: HaltInstrument\nMarketDataFailure
+    Halted --> Active: ResumeInstrument
+    Active --> Suspended: SuspendInstrument\nComplianceProhibition
+    Halted --> Suspended: EscalateHalt
+    Suspended --> Halted: IncidentMitigated
+    Active --> SettlementOnly: BeginRetirement
+    Halted --> SettlementOnly: BeginRetirement
+    SettlementOnly --> Retired: OpenInterestZero\nOrdersCleared
+    Retired --> Delisted: RetentionWindowElapsed
+    Delisted --> [*]
+```
+Test cases:
+•	Valid configuration requires approval before Active.
+•	Invalid tick size returns to Draft.
+•	Halt rejects new orders while cancels follow policy.
+•	Resume requires health checks.
+•	Retirement blocks new exposure until open interest is zero.
+Acceptance criteria:
+•	No trading service accepts orders unless state is Active.
+•	Admin actions are maker-checker approved and audited.
+•	State changes propagate to Trading, Risk, Market Data, and Gateway before success.
+•	Historical data and ledger references remain resolvable after Delisted.
 Business Rules:
 1.	Instruments must be created and configured before trading.
 2.	Instruments can be halted and resumed.
