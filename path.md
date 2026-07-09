@@ -5632,3 +5632,815 @@ src/risk/
 •	Performance targets are met
 •	Security controls are in place
 
+
+
+# Engineering Artifact Expansion Pack – Phase 2
+This section adds implementation-ready engineering artifacts for HES while preserving the existing architecture: no global sequencer, book-local ordering, single-writer Book Core, fixed-point arithmetic, event sourcing, hot/cold path separation, and no database, Kafka/Redpanda, or cloud dependency in the hot path.
+
+## 1. Architecture Decision Records
+
+### ADR-0001 Use Rust for Hot Path
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Gateway adapters, risk gates, event appenders, and Book Core must provide deterministic latency and memory safety under sustained bursts. |
+| Decision | Implement all hot-path components in Rust with explicit ownership, fixed-size allocations after startup, and no garbage-collected runtime. |
+| Alternatives considered | C++, Java, Go, TypeScript services. |
+| Why alternatives were rejected | C++ increases memory-safety burden; Java/Go GC adds tail-latency risk; TypeScript is unsuitable for microsecond execution. |
+| Consequences | Hot-path teams must maintain Rust proficiency and unsafe code must be isolated and reviewed. |
+| Trade-offs | Higher development rigor in exchange for predictable latency and safety. |
+| Performance impact | Improves p99 stability by eliminating GC pauses and enabling cache-aware data structures. |
+| Security impact | Reduces memory-corruption classes; unsafe blocks require formal review. |
+| Operational impact | Build, profiling, and incident tooling must support Rust binaries. |
+| Related sections | Architecture; Hot/Cold Path Separation; Book Core Thread Architecture |
+
+### ADR-0002 No Global Sequencer
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | A platform-wide sequencer creates cross-book coupling and limits throughput as symbols scale. |
+| Decision | Do not implement a global sequence for order decisions; sequence only within each book and reconcile cross-book views through event time and per-book offsets. |
+| Alternatives considered | Central sequencer, database sequence, Kafka partition used as global order. |
+| Why alternatives were rejected | They create single bottlenecks, expand blast radius, and violate book-local independence. |
+| Consequences | Global chronological reports require merge logic and cannot imply matching precedence across books. |
+| Trade-offs | Sacrifices simple total ordering for horizontal scalability. |
+| Performance impact | Removes centralized serialization from the hot path. |
+| Security impact | Limits systemic DoS from sequencer saturation. |
+| Operational impact | Operations monitor per-book sequence gaps rather than one global counter. |
+| Related sections | No Global Sequencer; Book-Local Ordering |
+
+### ADR-0003 Book-Local Ordering
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Matching correctness depends on deterministic order within an instrument book, not across independent books. |
+| Decision | Each Book Core owns a monotonic book_sequence assigned at ingress to that book. |
+| Alternatives considered | Wall-clock ordering, gateway arrival ordering, global event ordering. |
+| Why alternatives were rejected | Clock order is nondeterministic; gateway order conflicts across nodes; global event order bottlenecks. |
+| Consequences | Cross-book workflows must use explicit orchestration and cannot assume atomic book co-ordering. |
+| Trade-offs | Simple per-book determinism with more careful portfolio-level reporting. |
+| Performance impact | Enables parallel matching across books. |
+| Security impact | Improves auditability because every fill maps to a book-local sequence. |
+| Operational impact | Runbooks focus on symbol-level failover and replay. |
+| Related sections | Book Core State Machine; Deterministic Replay |
+
+### ADR-0004 Single-Writer Book Core
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Concurrent mutation of a central limit order book is difficult to prove and replay deterministically. |
+| Decision | Use one writer thread per active book shard; readers consume immutable snapshots or event streams. |
+| Alternatives considered | Multi-writer locks, software transactional memory, database row locking. |
+| Why alternatives were rejected | Locks and STM add jitter; DB locking is not hot-path viable. |
+| Consequences | One hot symbol is bounded by one core unless partitioned by product design. |
+| Trade-offs | Determinism and simplicity over intra-book write parallelism. |
+| Performance impact | Predictable cache locality and no lock contention inside book mutation. |
+| Security impact | Reduces race-condition attack surface. |
+| Operational impact | Capacity planning assigns hot symbols to dedicated cores. |
+| Related sections | Book Core; Matching Engine |
+
+### ADR-0005 Fixed-Point Arithmetic
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Financial balances, prices, margin, and fees require exact decimal behavior. |
+| Decision | Represent money and quantity as bounded fixed-point integers with instrument scale metadata. |
+| Alternatives considered | Floating point, arbitrary precision decimals everywhere, string decimals. |
+| Why alternatives were rejected | Float is non-deterministic for money; arbitrary decimals are slower; strings are unsafe for computation. |
+| Consequences | Scale migration requires instrument governance. |
+| Trade-offs | Less ergonomic math in exchange for exactness. |
+| Performance impact | Integer operations keep risk and matching checks fast. |
+| Security impact | Prevents rounding exploitation and precision drift. |
+| Operational impact | Operations must validate scale configuration before symbol enablement. |
+| Related sections | Risk Core; Clearing; Instrument State Machine |
+
+### ADR-0006 Event Sourcing as Source of Truth
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Exchange state must be reconstructable, auditable, and independently verifiable. |
+| Decision | All authoritative state transitions are derived from append-only engine events. |
+| Alternatives considered | Mutable database truth, cache truth, periodic snapshots only. |
+| Why alternatives were rejected | Mutable stores hide history; caches are ephemeral; snapshots alone cannot explain transitions. |
+| Consequences | Projection bugs can be repaired by replay; event schema compatibility becomes critical. |
+| Trade-offs | More storage and schema discipline for full auditability. |
+| Performance impact | Append is optimized; projections run outside decision path. |
+| Security impact | Tamper evidence improves forensic posture. |
+| Operational impact | Replay, compaction, and retention become first-class operations. |
+| Related sections | Event Log; Deterministic Replay |
+
+### ADR-0007 No Database in Hot Path
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Database calls introduce variable latency and operational coupling. |
+| Decision | No matching, risk admission, or event-commit decision may synchronously depend on a database. |
+| Alternatives considered | PostgreSQL transactions, Redis checks, distributed SQL. |
+| Why alternatives were rejected | They add tail latency, external failure modes, and recovery ambiguity. |
+| Consequences | Hot state must be preloaded and reconciled from events. |
+| Trade-offs | More complex warmup for deterministic low latency. |
+| Performance impact | Removes network/database p99 spikes from order decision flow. |
+| Security impact | Reduces injection and credential exposure in hot binaries. |
+| Operational impact | DB outages affect projections/admin views, not matching continuity. |
+| Related sections | Hot/Cold Path Separation |
+
+### ADR-0008 No Kafka/Redpanda Before Matching Decision
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Broker durability and batching are useful after decisions but not before them. |
+| Decision | Do not place Kafka/Redpanda or equivalent broker before Book Core decision and event append. |
+| Alternatives considered | Broker-first ingestion, broker as sequencer, broker-backed risk. |
+| Why alternatives were rejected | Broker latency, rebalancing, and partition semantics can stall trading decisions. |
+| Consequences | Post-decision publishers must tolerate replay and duplicate delivery. |
+| Trade-offs | Less off-the-shelf buffering before matching for stronger determinism. |
+| Performance impact | Avoids broker enqueue/dequeue cost in p99 order path. |
+| Security impact | Limits broker compromise impact on matching decisions. |
+| Operational impact | Publisher lag is monitored separately from engine health. |
+| Related sections | Event Publisher; Market Data |
+
+### ADR-0009 Active-Passive per Book, Active-Active across Books
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Two active writers for one book risk divergent state; many books still need high utilization. |
+| Decision | Run one active writer and at least one warm passive replica per book; distribute different books across active nodes. |
+| Alternatives considered | Active-active same book, cold standby only, global primary. |
+| Why alternatives were rejected | Same-book active-active requires consensus in hot path; cold standby increases RTO; global primary centralizes risk. |
+| Consequences | Failover is symbol scoped and requires fencing. |
+| Trade-offs | Lower per-book write availability than consensus, higher determinism. |
+| Performance impact | Normal traffic scales across symbols without per-order consensus. |
+| Security impact | Fencing prevents split-brain fills. |
+| Operational impact | Ops performs book-level promotion with sequence verification. |
+| Related sections | Deployment / Infrastructure; Book Core |
+
+### ADR-0010 Bounded Lock-Free Rings
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Unbounded queues hide overload and cause memory pressure. |
+| Decision | Use bounded lock-free rings for hot-path handoff and apply explicit backpressure/rejections. |
+| Alternatives considered | Unbounded queues, mutex queues, broker queues. |
+| Why alternatives were rejected | Unbounded queues fail late; mutex queues add contention; brokers violate hot path constraints. |
+| Consequences | Clients may receive ENGINE_BUSY during bursts. |
+| Trade-offs | Fail-fast behavior over latent degradation. |
+| Performance impact | Stable memory footprint and predictable handoff cost. |
+| Security impact | Prevents memory exhaustion abuse. |
+| Operational impact | Alerts track depth, drops, and sustained rejection rates. |
+| Related sections | Gateway; Book Core inbound rings |
+
+### ADR-0011 Credit Bucket Risk Model
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Order admission requires fast, conservative available-credit decisions. |
+| Decision | Maintain precomputed per-account credit buckets updated by accepted events and releases. |
+| Alternatives considered | Full portfolio recomputation per order, database balance lookup, optimistic post-trade risk. |
+| Why alternatives were rejected | They are too slow or unsafe for leverage products. |
+| Consequences | Cold-path reconciliation must prove bucket correctness. |
+| Trade-offs | Conservative holds may temporarily reduce usable balance. |
+| Performance impact | Constant-time admission for common order types. |
+| Security impact | Prevents overspend and negative-balance exploitation. |
+| Operational impact | Ops monitors bucket drift against ledger projections. |
+| Related sections | Risk Core; Clearing |
+
+### ADR-0012 Snapshot + Delta Market Data
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Clients require low-latency updates and recovery after packet loss. |
+| Decision | Publish book snapshots plus sequenced deltas per instrument. |
+| Alternatives considered | Full snapshot every tick, deltas only, polling REST books. |
+| Why alternatives were rejected | Full snapshots are bandwidth heavy; deltas only are hard to recover; polling is stale. |
+| Consequences | Clients must implement gap detection and resync. |
+| Trade-offs | Protocol complexity for efficient recovery. |
+| Performance impact | Deltas minimize fanout payload and snapshots bound recovery time. |
+| Security impact | Sequence checks reduce spoofed/stale book risk. |
+| Operational impact | Market data ops watch delta gap and snapshot age metrics. |
+| Related sections | Market Data |
+
+### ADR-0013 Idempotent client_order_id
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Clients retry during timeouts and network failures. |
+| Decision | Enforce account-scoped client_order_id idempotency for the configured retention window. |
+| Alternatives considered | Gateway-generated only IDs, accept duplicates, global client IDs. |
+| Why alternatives were rejected | Generated IDs do not solve retry ambiguity; duplicates double-submit; global namespace leaks and collides. |
+| Consequences | Requires idempotency cache restore during failover. |
+| Trade-offs | Storage overhead for safer client retries. |
+| Performance impact | Cache lookup is bounded and local to admission flow. |
+| Security impact | Prevents replay and duplicate order abuse. |
+| Operational impact | Ops can inspect duplicate decisions by account and ID. |
+| Related sections | Gateway; Order Lifecycle |
+
+### ADR-0014 Deterministic Replay
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Certification and incident analysis require identical state reconstruction. |
+| Decision | Replay events from snapshot plus deltas to reproduce hash chain, book state, balances, and reports. |
+| Alternatives considered | Best-effort replay, database restore, sampled audit. |
+| Why alternatives were rejected | They cannot prove exact matching behavior. |
+| Consequences | Non-deterministic dependencies are prohibited in replayed logic. |
+| Trade-offs | Strict coding constraints for high confidence. |
+| Performance impact | Replay may run offline; hot path emits sufficient deterministic data. |
+| Security impact | Supports non-repudiation and tamper detection. |
+| Operational impact | Replay is part of release gates and incident response. |
+| Related sections | Event Sourcing; Hash-Chained Engine Events |
+
+### ADR-0015 Hot/Cold Path Separation
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Administrative, analytics, and persistence workloads can disturb trading latency. |
+| Decision | Separate hot decision path from cold projections, reporting, compliance, and admin workflows. |
+| Alternatives considered | Unified service, shared database transactions, synchronous compliance enrichment. |
+| Why alternatives were rejected | They couple trading to slow workloads. |
+| Consequences | Cold systems may lag but cannot change accepted decisions directly. |
+| Trade-offs | Eventual consistency for views in exchange for stable matching. |
+| Performance impact | Protects order p99 from reporting spikes. |
+| Security impact | Limits blast radius of admin/reporting compromise. |
+| Operational impact | Operations use separate SLOs for hot and cold paths. |
+| Related sections | Architecture; Operations |
+
+### ADR-0016 Hash-Chained Engine Events
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Event tampering must be detectable across storage and replication. |
+| Decision | Each authoritative event includes previous hash, payload hash, sequence metadata, and signer context where applicable. |
+| Alternatives considered | Plain append log, database audit rows, periodic checksums only. |
+| Why alternatives were rejected | They detect less tampering or lack ordering proof. |
+| Consequences | Schema changes must preserve canonical encoding. |
+| Trade-offs | CPU/storage overhead for audit strength. |
+| Performance impact | Hashing cost is budgeted in event append targets. |
+| Security impact | Improves forensic integrity and non-repudiation. |
+| Operational impact | Ops verifies chains continuously and during restore. |
+| Related sections | Event Log; Security |
+
+### ADR-0017 Maker-Checker Admin Controls
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Privileged changes can affect funds, symbols, risk limits, and withdrawals. |
+| Decision | Require dual approval, scoped permissions, reason codes, and event logging for sensitive admin actions. |
+| Alternatives considered | Single-admin changes, chat approvals, database edits. |
+| Why alternatives were rejected | They are unauditable and vulnerable to insider misuse. |
+| Consequences | Emergency workflows need pre-approved break-glass controls. |
+| Trade-offs | Operational friction for stronger control. |
+| Performance impact | No hot-path impact; admin actions are cold-path events. |
+| Security impact | Reduces insider and credential-compromise risk. |
+| Operational impact | Ops maintains approval queues and periodic access reviews. |
+| Related sections | Admin Console; Compliance |
+
+### ADR-0018 Withdrawal Engine Separate from Trading Core
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Withdrawals require external networks, AML checks, and signing ceremonies unsuitable for matching. |
+| Decision | Keep withdrawal orchestration outside Book Core while consuming ledger-verified available balances. |
+| Alternatives considered | Trading core signs withdrawals, shared wallet/matching service, manual-only withdrawals. |
+| Why alternatives were rejected | They expand hot-path blast radius or cannot scale. |
+| Consequences | Withdrawal delays must not block trading. |
+| Trade-offs | More integration points but safer isolation. |
+| Performance impact | No effect on matching latency. |
+| Security impact | Separates key custody and trading compromise domains. |
+| Operational impact | Ops monitors withdrawal queues independently. |
+| Related sections | Wallet; Withdrawal Engine |
+
+### ADR-0019 Feature Flags and Canary Symbols
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | Exchange changes must be rolled out safely by symbol, account cohort, or feature. |
+| Decision | Gate risky behavior behind audited feature flags and canary symbols with rollback plans. |
+| Alternatives considered | Big-bang releases, environment-only flags, ad hoc config edits. |
+| Why alternatives were rejected | They make rollback and attribution hard. |
+| Consequences | Flag state must be versioned and replay-visible when it affects decisions. |
+| Trade-offs | Flag complexity for controlled launches. |
+| Performance impact | Flag checks in hot path must be static or precomputed. |
+| Security impact | Reduces exposure to flawed features. |
+| Operational impact | Ops owns canary dashboards and rollback triggers. |
+| Related sections | Deployment; Production Readiness |
+
+### ADR-0020 Production Readiness Gates
+| Field | Detail |
+|---|---|
+| Status | Approved |
+| Context | A trading system must not launch without measurable proof of correctness, latency, and resilience. |
+| Decision | Require formal gates for determinism, latency, security, operational runbooks, failover, and compliance evidence. |
+| Alternatives considered | Team sign-off only, best-effort testing, launch then harden. |
+| Why alternatives were rejected | They do not provide objective readiness evidence. |
+| Consequences | Launch can be delayed by failed gates. |
+| Trade-offs | Slower release cadence for reduced catastrophic risk. |
+| Performance impact | Performance gates prevent regressions. |
+| Security impact | Security gates verify controls before exposure. |
+| Operational impact | Ops requires rehearsed runbooks and rollback criteria. |
+| Related sections | Production Readiness; Review Checklists |
+
+## 2. Requirements Traceability Matrix
+
+| Requirement ID | Requirement statement | Source section | ADR reference | Design component | Implementation module | Test case ID | Status |
+|---|---|---|---|---|---|---|---|
+| REQ-GWY-001 | Gateway shall validate bounded input before enqueue for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-001 | Implemented |
+| REQ-GWY-002 | Gateway shall emit deterministic audit event for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-002 | Certified |
+| REQ-GWY-003 | Gateway shall reject overload before latency degradation for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-003 | Approved |
+| REQ-GWY-004 | Gateway shall use fixed-point values only for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-004 | Tested |
+| REQ-GWY-005 | Gateway shall restore state from event replay for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-005 | Draft |
+| REQ-GWY-006 | Gateway shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-006 | Implemented |
+| REQ-GWY-007 | Gateway shall enforce idempotent command handling for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-007 | Certified |
+| REQ-GWY-008 | Gateway shall support canary feature flagging for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-008 | Approved |
+| REQ-GWY-009 | Gateway shall verify hash-chain continuity for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-009 | Tested |
+| REQ-GWY-010 | Gateway shall provide runbook-visible status for book-local, event-sourced operation. | Gateway | ADR-0010 | gateway | src/gateway | TC-GWY-010 | Draft |
+| REQ-TRD-001 | Trading shall validate bounded input before enqueue for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-001 | Implemented |
+| REQ-TRD-002 | Trading shall emit deterministic audit event for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-002 | Certified |
+| REQ-TRD-003 | Trading shall reject overload before latency degradation for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-003 | Approved |
+| REQ-TRD-004 | Trading shall use fixed-point values only for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-004 | Tested |
+| REQ-TRD-005 | Trading shall restore state from event replay for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-005 | Draft |
+| REQ-TRD-006 | Trading shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-006 | Implemented |
+| REQ-TRD-007 | Trading shall enforce idempotent command handling for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-007 | Certified |
+| REQ-TRD-008 | Trading shall support canary feature flagging for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-008 | Approved |
+| REQ-TRD-009 | Trading shall verify hash-chain continuity for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-009 | Tested |
+| REQ-TRD-010 | Trading shall provide runbook-visible status for book-local, event-sourced operation. | Trading | ADR-0013 | trading service | src/trading | TC-TRD-010 | Draft |
+| REQ-BOK-001 | Book Core shall validate bounded input before enqueue for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-001 | Implemented |
+| REQ-BOK-002 | Book Core shall emit deterministic audit event for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-002 | Certified |
+| REQ-BOK-003 | Book Core shall reject overload before latency degradation for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-003 | Approved |
+| REQ-BOK-004 | Book Core shall use fixed-point values only for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-004 | Tested |
+| REQ-BOK-005 | Book Core shall restore state from event replay for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-005 | Draft |
+| REQ-BOK-006 | Book Core shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-006 | Implemented |
+| REQ-BOK-007 | Book Core shall enforce idempotent command handling for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-007 | Certified |
+| REQ-BOK-008 | Book Core shall support canary feature flagging for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-008 | Approved |
+| REQ-BOK-009 | Book Core shall verify hash-chain continuity for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-009 | Tested |
+| REQ-BOK-010 | Book Core shall provide runbook-visible status for book-local, event-sourced operation. | Book Core | ADR-0004 | book core | src/book | TC-BOK-010 | Draft |
+| REQ-MAT-001 | Matching shall validate bounded input before enqueue for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-001 | Implemented |
+| REQ-MAT-002 | Matching shall emit deterministic audit event for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-002 | Certified |
+| REQ-MAT-003 | Matching shall reject overload before latency degradation for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-003 | Approved |
+| REQ-MAT-004 | Matching shall use fixed-point values only for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-004 | Tested |
+| REQ-MAT-005 | Matching shall restore state from event replay for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-005 | Draft |
+| REQ-MAT-006 | Matching shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-006 | Implemented |
+| REQ-MAT-007 | Matching shall enforce idempotent command handling for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-007 | Certified |
+| REQ-MAT-008 | Matching shall support canary feature flagging for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-008 | Approved |
+| REQ-MAT-009 | Matching shall verify hash-chain continuity for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-009 | Tested |
+| REQ-MAT-010 | Matching shall provide runbook-visible status for book-local, event-sourced operation. | Matching | ADR-0003 | matching engine | src/matching | TC-MAT-010 | Draft |
+| REQ-RSK-001 | Risk shall validate bounded input before enqueue for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-001 | Implemented |
+| REQ-RSK-002 | Risk shall emit deterministic audit event for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-002 | Certified |
+| REQ-RSK-003 | Risk shall reject overload before latency degradation for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-003 | Approved |
+| REQ-RSK-004 | Risk shall use fixed-point values only for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-004 | Tested |
+| REQ-RSK-005 | Risk shall restore state from event replay for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-005 | Draft |
+| REQ-RSK-006 | Risk shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-006 | Implemented |
+| REQ-RSK-007 | Risk shall enforce idempotent command handling for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-007 | Certified |
+| REQ-RSK-008 | Risk shall support canary feature flagging for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-008 | Approved |
+| REQ-RSK-009 | Risk shall verify hash-chain continuity for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-009 | Tested |
+| REQ-RSK-010 | Risk shall provide runbook-visible status for book-local, event-sourced operation. | Risk | ADR-0011 | risk core | src/risk | TC-RSK-010 | Draft |
+| REQ-CLR-001 | Clearing shall validate bounded input before enqueue for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-001 | Implemented |
+| REQ-CLR-002 | Clearing shall emit deterministic audit event for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-002 | Certified |
+| REQ-CLR-003 | Clearing shall reject overload before latency degradation for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-003 | Approved |
+| REQ-CLR-004 | Clearing shall use fixed-point values only for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-004 | Tested |
+| REQ-CLR-005 | Clearing shall restore state from event replay for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-005 | Draft |
+| REQ-CLR-006 | Clearing shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-006 | Implemented |
+| REQ-CLR-007 | Clearing shall enforce idempotent command handling for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-007 | Certified |
+| REQ-CLR-008 | Clearing shall support canary feature flagging for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-008 | Approved |
+| REQ-CLR-009 | Clearing shall verify hash-chain continuity for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-009 | Tested |
+| REQ-CLR-010 | Clearing shall provide runbook-visible status for book-local, event-sourced operation. | Clearing | ADR-0005 | clearing engine | src/clearing | TC-CLR-010 | Draft |
+| REQ-EVT-001 | Event Log shall validate bounded input before enqueue for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-001 | Implemented |
+| REQ-EVT-002 | Event Log shall emit deterministic audit event for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-002 | Certified |
+| REQ-EVT-003 | Event Log shall reject overload before latency degradation for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-003 | Approved |
+| REQ-EVT-004 | Event Log shall use fixed-point values only for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-004 | Tested |
+| REQ-EVT-005 | Event Log shall restore state from event replay for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-005 | Draft |
+| REQ-EVT-006 | Event Log shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-006 | Implemented |
+| REQ-EVT-007 | Event Log shall enforce idempotent command handling for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-007 | Certified |
+| REQ-EVT-008 | Event Log shall support canary feature flagging for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-008 | Approved |
+| REQ-EVT-009 | Event Log shall verify hash-chain continuity for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-009 | Tested |
+| REQ-EVT-010 | Event Log shall provide runbook-visible status for book-local, event-sourced operation. | Event Log | ADR-0006 | event log | src/event_log | TC-EVT-010 | Draft |
+| REQ-MKD-001 | Market Data shall validate bounded input before enqueue for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-001 | Implemented |
+| REQ-MKD-002 | Market Data shall emit deterministic audit event for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-002 | Certified |
+| REQ-MKD-003 | Market Data shall reject overload before latency degradation for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-003 | Approved |
+| REQ-MKD-004 | Market Data shall use fixed-point values only for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-004 | Tested |
+| REQ-MKD-005 | Market Data shall restore state from event replay for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-005 | Draft |
+| REQ-MKD-006 | Market Data shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-006 | Implemented |
+| REQ-MKD-007 | Market Data shall enforce idempotent command handling for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-007 | Certified |
+| REQ-MKD-008 | Market Data shall support canary feature flagging for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-008 | Approved |
+| REQ-MKD-009 | Market Data shall verify hash-chain continuity for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-009 | Tested |
+| REQ-MKD-010 | Market Data shall provide runbook-visible status for book-local, event-sourced operation. | Market Data | ADR-0012 | market data | src/market_data | TC-MKD-010 | Draft |
+| REQ-WAL-001 | Wallet shall validate bounded input before enqueue for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-001 | Implemented |
+| REQ-WAL-002 | Wallet shall emit deterministic audit event for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-002 | Certified |
+| REQ-WAL-003 | Wallet shall reject overload before latency degradation for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-003 | Approved |
+| REQ-WAL-004 | Wallet shall use fixed-point values only for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-004 | Tested |
+| REQ-WAL-005 | Wallet shall restore state from event replay for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-005 | Draft |
+| REQ-WAL-006 | Wallet shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-006 | Implemented |
+| REQ-WAL-007 | Wallet shall enforce idempotent command handling for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-007 | Certified |
+| REQ-WAL-008 | Wallet shall support canary feature flagging for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-008 | Approved |
+| REQ-WAL-009 | Wallet shall verify hash-chain continuity for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-009 | Tested |
+| REQ-WAL-010 | Wallet shall provide runbook-visible status for book-local, event-sourced operation. | Wallet | ADR-0018 | wallet | src/wallet | TC-WAL-010 | Draft |
+| REQ-FUT-001 | Futures shall validate bounded input before enqueue for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-001 | Implemented |
+| REQ-FUT-002 | Futures shall emit deterministic audit event for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-002 | Certified |
+| REQ-FUT-003 | Futures shall reject overload before latency degradation for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-003 | Approved |
+| REQ-FUT-004 | Futures shall use fixed-point values only for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-004 | Tested |
+| REQ-FUT-005 | Futures shall restore state from event replay for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-005 | Draft |
+| REQ-FUT-006 | Futures shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-006 | Implemented |
+| REQ-FUT-007 | Futures shall enforce idempotent command handling for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-007 | Certified |
+| REQ-FUT-008 | Futures shall support canary feature flagging for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-008 | Approved |
+| REQ-FUT-009 | Futures shall verify hash-chain continuity for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-009 | Tested |
+| REQ-FUT-010 | Futures shall provide runbook-visible status for book-local, event-sourced operation. | Futures | ADR-0011 | futures engine | src/futures | TC-FUT-010 | Draft |
+| REQ-OPT-001 | Options shall validate bounded input before enqueue for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-001 | Implemented |
+| REQ-OPT-002 | Options shall emit deterministic audit event for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-002 | Certified |
+| REQ-OPT-003 | Options shall reject overload before latency degradation for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-003 | Approved |
+| REQ-OPT-004 | Options shall use fixed-point values only for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-004 | Tested |
+| REQ-OPT-005 | Options shall restore state from event replay for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-005 | Draft |
+| REQ-OPT-006 | Options shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-006 | Implemented |
+| REQ-OPT-007 | Options shall enforce idempotent command handling for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-007 | Certified |
+| REQ-OPT-008 | Options shall support canary feature flagging for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-008 | Approved |
+| REQ-OPT-009 | Options shall verify hash-chain continuity for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-009 | Tested |
+| REQ-OPT-010 | Options shall provide runbook-visible status for book-local, event-sourced operation. | Options | ADR-0005 | options engine | src/options | TC-OPT-010 | Draft |
+| REQ-SEC-001 | Security shall validate bounded input before enqueue for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-001 | Implemented |
+| REQ-SEC-002 | Security shall emit deterministic audit event for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-002 | Certified |
+| REQ-SEC-003 | Security shall reject overload before latency degradation for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-003 | Approved |
+| REQ-SEC-004 | Security shall use fixed-point values only for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-004 | Tested |
+| REQ-SEC-005 | Security shall restore state from event replay for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-005 | Draft |
+| REQ-SEC-006 | Security shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-006 | Implemented |
+| REQ-SEC-007 | Security shall enforce idempotent command handling for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-007 | Certified |
+| REQ-SEC-008 | Security shall support canary feature flagging for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-008 | Approved |
+| REQ-SEC-009 | Security shall verify hash-chain continuity for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-009 | Tested |
+| REQ-SEC-010 | Security shall provide runbook-visible status for book-local, event-sourced operation. | Security | ADR-0016 | security controls | src/security | TC-SEC-010 | Draft |
+| REQ-OPS-001 | Operations shall validate bounded input before enqueue for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-001 | Implemented |
+| REQ-OPS-002 | Operations shall emit deterministic audit event for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-002 | Certified |
+| REQ-OPS-003 | Operations shall reject overload before latency degradation for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-003 | Approved |
+| REQ-OPS-004 | Operations shall use fixed-point values only for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-004 | Tested |
+| REQ-OPS-005 | Operations shall restore state from event replay for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-005 | Draft |
+| REQ-OPS-006 | Operations shall expose p50/p95/p99 metrics for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-006 | Implemented |
+| REQ-OPS-007 | Operations shall enforce idempotent command handling for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-007 | Certified |
+| REQ-OPS-008 | Operations shall support canary feature flagging for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-008 | Approved |
+| REQ-OPS-009 | Operations shall verify hash-chain continuity for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-009 | Tested |
+| REQ-OPS-010 | Operations shall provide runbook-visible status for book-local, event-sourced operation. | Operations | ADR-0020 | ops platform | ops | TC-OPS-010 | Draft |
+
+## 3. Failure Mode and Effects Analysis
+
+### FMEA – Gateway
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Gateway inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-GATEWAY-001 |
+| Gateway emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-GATEWAY-002 |
+
+### FMEA – Instrument Router
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Instrument Router inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-INSTRUMENT-R-001 |
+| Instrument Router emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-INSTRUMENT-R-002 |
+
+### FMEA – Book Core
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Book Core inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-BOOK-CORE-001 |
+| Book Core emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-BOOK-CORE-002 |
+
+### FMEA – Matching Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Matching Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-MATCHING-ENG-001 |
+| Matching Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-MATCHING-ENG-002 |
+
+### FMEA – Risk Core
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Risk Core inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-RISK-CORE-001 |
+| Risk Core emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-RISK-CORE-002 |
+
+### FMEA – Clearing Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Clearing Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-CLEARING-ENG-001 |
+| Clearing Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-CLEARING-ENG-002 |
+
+### FMEA – Event Log
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Event Log inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-EVENT-LOG-001 |
+| Event Log emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-EVENT-LOG-002 |
+
+### FMEA – Event Publisher
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Event Publisher inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-EVENT-PUBLIS-001 |
+| Event Publisher emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-EVENT-PUBLIS-002 |
+
+### FMEA – Market Data
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Market Data inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-MARKET-DATA-001 |
+| Market Data emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-MARKET-DATA-002 |
+
+### FMEA – Ledger Projection
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Ledger Projection inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-LEDGER-PROJE-001 |
+| Ledger Projection emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-LEDGER-PROJE-002 |
+
+### FMEA – Wallet
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Wallet inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-WALLET-001 |
+| Wallet emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-WALLET-002 |
+
+### FMEA – Withdrawal Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Withdrawal Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-WITHDRAWAL-E-001 |
+| Withdrawal Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-WITHDRAWAL-E-002 |
+
+### FMEA – Futures Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Futures Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-FUTURES-ENGI-001 |
+| Futures Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-FUTURES-ENGI-002 |
+
+### FMEA – Margin Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Margin Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-MARGIN-ENGIN-001 |
+| Margin Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-MARGIN-ENGIN-002 |
+
+### FMEA – Liquidation Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Liquidation Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-LIQUIDATION--001 |
+| Liquidation Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-LIQUIDATION--002 |
+
+### FMEA – Options Engine
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Options Engine inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-OPTIONS-ENGI-001 |
+| Options Engine emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-OPTIONS-ENGI-002 |
+
+### FMEA – Admin Console
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Admin Console inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-ADMIN-CONSOL-001 |
+| Admin Console emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-ADMIN-CONSOL-002 |
+
+### FMEA – Surveillance
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Surveillance inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-SURVEILLANCE-001 |
+| Surveillance emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-SURVEILLANCE-002 |
+
+### FMEA – Compliance
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Compliance inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-COMPLIANCE-001 |
+| Compliance emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-COMPLIANCE-002 |
+
+### FMEA – Observability
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Observability inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-OBSERVABILIT-001 |
+| Observability emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-OBSERVABILIT-002 |
+
+### FMEA – Deployment / Infrastructure
+| Failure mode | Cause | Detection signal | Impact | Immediate mitigation | Recovery procedure | Preventive control | Required test case |
+|---|---|---|---|---|---|---|---|
+| Deployment / Infrastructure inbound ring exceeds 90% depth during symbol-specific burst | Bot-driven traffic or downstream pause | queue_depth > 90%, p99 handoff rising | Orders risk queuing beyond SLO | Return ENGINE_BUSY or throttle non-priority flow | Drain ring, confirm sequence continuity, replay rejected window from client logs if needed | Bounded rings, per-account rate limits, capacity tests | TC-FMEA-DEPLOYMENT-I-001 |
+| Deployment / Infrastructure emits or consumes non-monotonic book-local sequence | Bad failover, stale replica, or replay bug | sequence_gap, previous_hash mismatch, duplicate sequence alert | Potential divergent state or client gap | Fence component and stop affected book flow | Promote verified passive or replay from last valid snapshot and delta | Fencing tokens, deterministic replay gate, hash-chain verification | TC-FMEA-DEPLOYMENT-I-002 |
+
+## 4. Latency Budget Tables
+All values are **Initial Target – to be benchmarked** in production-like hardware, pinned CPU, realistic payload sizes, and representative burst profiles.
+
+### Latency Budget – Retail REST order placement
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 25 µs | 50 µs | 100 µs | 200 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 50 µs | 100 µs | 200 µs | 400 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 75 µs | 150 µs | 300 µs | 600 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 125 µs | 250 µs | 500 µs | 1000 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Signed API order placement
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – FIX order placement
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 10 µs | 20 µs | 40 µs | 80 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 30 µs | 60 µs | 120 µs | 240 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 50 µs | 100 µs | 200 µs | 400 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Book Core internal execution
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 10 µs | 20 µs | 40 µs | 80 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 30 µs | 60 µs | 120 µs | 240 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 50 µs | 100 µs | 200 µs | 400 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Risk check
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 10 µs | 20 µs | 40 µs | 80 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 30 µs | 60 µs | 120 µs | 240 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 50 µs | 100 µs | 200 µs | 400 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Clearing calculation
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Event append
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Gateway response
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Market data fanout
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+### Latency Budget – Private execution report
+| Stage | Target p50 | Target p95 | Target p99 | Hard limit | Measurement method | Alert threshold |
+|---|---:|---:|---:|---:|---|---|
+| parse/validate | 20 µs | 40 µs | 80 µs | 160 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| auth/risk lookup | 40 µs | 80 µs | 160 µs | 320 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| book handoff | 60 µs | 120 µs | 240 µs | 480 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| decision/append | 80 µs | 160 µs | 320 µs | 640 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+| response/fanout | 100 µs | 200 µs | 400 µs | 800 µs | monotonic in-process timer plus trace span | sustained p99 > 80% hard limit for 5 minutes |
+
+## 5. Review Checklists
+
+### Review Checklist – Gateway
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Gateway. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Gateway. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Gateway. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Gateway. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Gateway. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Gateway. |
+
+### Review Checklist – Book Core
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Book Core. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Book Core. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Book Core. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Book Core. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Book Core. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Book Core. |
+
+### Review Checklist – Matching Engine
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Matching Engine. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Matching Engine. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Matching Engine. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Matching Engine. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Matching Engine. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Matching Engine. |
+
+### Review Checklist – Risk Core
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Risk Core. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Risk Core. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Risk Core. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Risk Core. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Risk Core. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Risk Core. |
+
+### Review Checklist – Clearing
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Clearing. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Clearing. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Clearing. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Clearing. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Clearing. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Clearing. |
+
+### Review Checklist – Event Log
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Event Log. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Event Log. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Event Log. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Event Log. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Event Log. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Event Log. |
+
+### Review Checklist – Wallet
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Wallet. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Wallet. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Wallet. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Wallet. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Wallet. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Wallet. |
+
+### Review Checklist – Market Data
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Market Data. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Market Data. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Market Data. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Market Data. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Market Data. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Market Data. |
+
+### Review Checklist – Futures
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Futures. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Futures. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Futures. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Futures. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Futures. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Futures. |
+
+### Review Checklist – Options
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Options. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Options. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Options. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Options. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Options. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Options. |
+
+### Review Checklist – Liquidation
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Liquidation. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Liquidation. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Liquidation. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Liquidation. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Liquidation. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Liquidation. |
+
+### Review Checklist – Security
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Security. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Security. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Security. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Security. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Security. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Security. |
+
+### Review Checklist – Observability
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Observability. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Observability. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Observability. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Observability. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Observability. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Observability. |
+
+### Review Checklist – Production Readiness
+| Review area | Verifiable checklist items |
+|---|---|
+| Developer review checklist | Code path uses fixed-point types, no hot-path DB/broker call, and unit tests cover accepted, rejected, and replayed commands for Production Readiness. |
+| Architect review checklist | Design preserves book-local ordering, single-writer mutation where applicable, and explicit hot/cold boundary for Production Readiness. |
+| QA review checklist | Integration suite includes deterministic replay, idempotent retry, failover, and sequence-gap scenarios for Production Readiness. |
+| Performance review checklist | Benchmark records p50/p95/p99 against Phase 2 latency budget with queue depth and CPU affinity captured for Production Readiness. |
+| Security review checklist | Threat review verifies authz, audit events, hash-chain impact, secret handling, and abuse throttles for Production Readiness. |
+| Operations review checklist | Runbook contains dashboards, alerts, rollback steps, canary criteria, and recovery validation for Production Readiness. |
+
+## Phase 2 Enhancement Summary
+1. ADRs added: 20 detailed Architecture Decision Records from ADR-0001 through ADR-0020.
+2. Requirements added: 130 traceable requirements across Gateway, Trading, Book Core, Matching, Risk, Clearing, Event Log, Market Data, Wallet, Futures, Options, Security, and Operations.
+3. FMEA tables added: 21 subsystem-specific FMEA tables with concrete detection, mitigation, recovery, prevention, and test references.
+4. Latency budgets added: 10 initial target latency budget tables marked “Initial Target – to be benchmarked”.
+5. Review checklists added: 14 component checklists spanning developer, architect, QA, performance, security, and operations reviews.
+6. Known remaining gaps: numeric latency targets require hardware benchmarking; test case IDs require binding to the eventual automated test suite; operational thresholds require calibration during canary-symbol rehearsals; regulatory control mappings require jurisdiction-specific compliance review.
