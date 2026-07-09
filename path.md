@@ -9985,176 +9985,995 @@ Do not add hot-path cold ledger reads, database calls, floating point math, glob
 
 ### Purpose
 
-TODO: Specify deterministic fee, rebate, balance delta, and position delta construction for fills.
+Define the deterministic clearing pipeline that converts matched trades and non-trade settlement triggers into immutable clearing, wallet, fee, position, and ledger deltas. Clearing is book-local, fixed-point, replayable, and produces the only hot-path accounting payload consumed by cold ledger projection.
 
-### Planned subsections
+### Scope
 
-- Maker/taker fee inputs.
-- Fee tier snapshot.
-- Spot clearing deltas.
-- Futures position deltas.
-- Rounding policy.
-- Fee event fields.
+This chapter covers spot settlement, futures settlement, options premium/exercise settlement, funding, margin changes, fee calculation, referral rebates, liquidity rebates, insurance-fund movements, wallet deltas, position deltas, journal entries, failed settlement handling, idempotent retry, and reconciliation. It does not define matching priority or external database posting.
 
-### Key algorithms
+### Responsibilities
 
-- `calculate_fee()`
-- `calculate_spot_delta()`
-- `calculate_futures_delta()`
-- `apply_rounding_policy()`
+| Component | Responsibility | Hot path rule |
+|---|---|---|
+| Book Core | Emits matched trade facts in book sequence order | Single writer only |
+| Clearing Engine | Builds deterministic deltas from trade facts and fee snapshots | No locks, no allocation after warmup |
+| Risk Cache | Applies reservations, margin, positions, and wallet deltas | No database reads |
+| Event Builder | Embeds clearing delta in `EngineEvent` | Immutable after seal |
+| Cold Ledger Projector | Projects journals asynchronously from events | Never before decision |
 
-### Required Rust interfaces
+### Inputs
 
-- `FeeScheduleSnapshot`
-- `FeeDelta`
-- `ClearingDelta`
-- `PositionDelta`
-- `RoundingMode`
+| Input | Source | Determinism requirement |
+|---|---|---|
+| `TradeFact` | Matching algorithm | Contains book sequence, maker/taker ids, price, quantity, product id |
+| `FeeScheduleSnapshot` | Sequenced admin event | Versioned and effective at or before trade sequence |
+| `ReservationState` | Risk cache | Read by key only, no scans |
+| `PositionState` | Risk cache | Fixed-point signed integers |
+| `AssetPrecision` | Static product config event | Immutable within event version |
+| `FundingRateSnapshot` | Sequenced funding event | Fixed-point rate numerator/denominator |
 
-### Required diagrams
+### Outputs
 
-- Fill to clearing delta flow.
-- Fee rounding decision tree.
+`ClearingDelta`, `WalletDelta`, `FeeDelta`, `PositionDelta`, `LedgerJournal`, `ReservationDelta`, and settlement status embedded into a single immutable `EngineEvent`.
 
-### Required test vectors
+### Data Structures
 
-- Maker rebate, taker fee, zero-fee tier, minimum fee, futures long/short update, rounding boundary.
+```rust
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Fixed { pub atoms: i128, pub scale: u32 }
 
-### Codex expansion placeholder
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum ProductKind { Spot, PerpetualFuture, DatedFuture, Option }
 
-TODO: Expand Chapter 9 into full implementation-grade specification with exact integer formulas and replay checks.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum FeeRole { Maker, Taker }
+
+pub struct FeeScheduleSnapshot {
+    pub schedule_id: u64,
+    pub version: u32,
+    pub effective_book_seq: u64,
+    pub maker_bps: i64,
+    pub taker_bps: i64,
+    pub vip_tier: u16,
+    pub referral_rebate_bps: u32,
+    pub liquidity_rebate_bps: u32,
+    pub min_fee_atoms: i128,
+    pub fee_asset: AssetId,
+    pub rounding: RoundingMode,
+}
+
+pub struct ClearingDelta {
+    pub trade_id: TradeId,
+    pub product: ProductId,
+    pub kind: ProductKind,
+    pub maker_wallet: WalletDelta,
+    pub taker_wallet: WalletDelta,
+    pub maker_fee: FeeDelta,
+    pub taker_fee: FeeDelta,
+    pub maker_position: Option<PositionDelta>,
+    pub taker_position: Option<PositionDelta>,
+    pub journal: LedgerJournal,
+    pub insurance_delta: Option<WalletDelta>,
+    pub settlement_state: SettlementState,
+}
+
+pub struct WalletDelta { pub account: AccountId, pub asset: AssetId, pub available: i128, pub reserved: i128 }
+pub struct PositionDelta { pub account: AccountId, pub product: ProductId, pub qty: i128, pub cost: i128, pub realized_pnl: i128, pub margin: i128 }
+pub struct FeeDelta { pub payer: AccountId, pub recipient: FeeRecipient, pub asset: AssetId, pub atoms: i128, pub role: FeeRole, pub schedule_id: u64 }
+pub struct JournalLine { pub account: LedgerAccount, pub asset: AssetId, pub debit: i128, pub credit: i128 }
+pub struct LedgerJournal { pub journal_id: u128, pub trade_id: TradeId, pub lines: SmallVec<[JournalLine; 16]>, pub checksum: u128 }
+```
+
+### Algorithm
+
+1. Load sequenced fee, precision, and product configuration snapshots effective for `trade.book_seq`.
+2. Generate product-specific gross settlement deltas: spot cash/asset exchange, futures position and margin mutation, or options premium/position mutation.
+3. Calculate maker/taker fees using fixed-point notional, VIP tier, referral, and liquidity rebate inputs.
+4. Round fees toward the exchange for positive fees and toward zero for rebates unless the schedule explicitly states stricter dust handling.
+5. Apply wallet deltas against reserved balances first, then available balances.
+6. Apply position deltas after wallet reservation consumption and before fee journal finalization.
+7. Build double-entry journal lines; debit total must equal credit total per asset.
+8. Validate no account balance becomes negative unless the product config allows isolated margin loss capped by reserved margin.
+9. Seal the clearing delta into the same `TradeExecuted` event as the trade facts.
+10. On deterministic failure, emit `SettlementFailed` administrative payload and halt the book before publication of inconsistent state.
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> FeesCalculated
+    FeesCalculated --> WalletsApplied
+    WalletsApplied --> PositionsApplied
+    PositionsApplied --> JournalBuilt
+    JournalBuilt --> Validated
+    Validated --> Settled
+    Pending --> Failed
+    FeesCalculated --> Failed
+    WalletsApplied --> Failed
+    PositionsApplied --> Failed
+    Failed --> Retryable: idempotency_key matched
+    Retryable --> Settled
+```
+
+### Rust pseudocode
+
+```rust
+pub fn process_clearing(ctx: &mut ClearingContext, trade: TradeFact) -> Result<ClearingDelta, ClearingError> {
+    let schedule = ctx.fee_schedule_at(trade.book_seq)?;
+    let product = ctx.product_config(trade.product)?;
+    let mut delta = generate_clearing_delta(ctx, trade, product, schedule)?;
+    delta.maker_fee = apply_fee(ctx, &trade, FeeRole::Maker, schedule)?;
+    delta.taker_fee = apply_fee(ctx, &trade, FeeRole::Taker, schedule)?;
+    apply_wallet_delta(ctx, delta.maker_wallet)?;
+    apply_wallet_delta(ctx, delta.taker_wallet)?;
+    if let Some(p) = delta.maker_position { apply_position_delta(ctx, p)?; }
+    if let Some(p) = delta.taker_position { apply_position_delta(ctx, p)?; }
+    delta.journal = build_journal(&delta)?;
+    validate_balance_conservation(ctx, &delta)?;
+    delta.settlement_state = SettlementState::Settled;
+    Ok(delta)
+}
+
+pub fn apply_fee(ctx: &ClearingContext, trade: &TradeFact, role: FeeRole, s: FeeScheduleSnapshot) -> Result<FeeDelta, ClearingError> {
+    let rate_bps: i64 = match role { FeeRole::Maker => s.maker_bps, FeeRole::Taker => s.taker_bps };
+    let notional = checked_mul_i128(trade.price_atoms, trade.qty_atoms)? / ctx.qty_scale(trade.product);
+    let raw = checked_mul_i128(notional, rate_bps as i128)? / 10_000;
+    let rounded = round_fee(raw, s.min_fee_atoms, s.rounding, ctx.asset_precision(s.fee_asset));
+    Ok(FeeDelta { payer: trade.account_for(role), recipient: FeeRecipient::Exchange, asset: s.fee_asset, atoms: rounded, role, schedule_id: s.schedule_id })
+}
+
+pub fn apply_wallet_delta(ctx: &mut ClearingContext, d: WalletDelta) -> Result<(), ClearingError> {
+    let w = ctx.wallet_mut(d.account, d.asset)?;
+    w.reserved = checked_add_i128(w.reserved, d.reserved)?;
+    w.available = checked_add_i128(w.available, d.available)?;
+    if w.available < 0 || w.reserved < 0 { return Err(ClearingError::NegativeBalance); }
+    Ok(())
+}
+
+pub fn apply_position_delta(ctx: &mut ClearingContext, d: PositionDelta) -> Result<(), ClearingError> {
+    let p = ctx.position_mut(d.account, d.product)?;
+    p.qty = checked_add_i128(p.qty, d.qty)?;
+    p.cost = checked_add_i128(p.cost, d.cost)?;
+    p.realized_pnl = checked_add_i128(p.realized_pnl, d.realized_pnl)?;
+    p.margin = checked_add_i128(p.margin, d.margin)?;
+    if p.margin < 0 { return Err(ClearingError::NegativeMargin); }
+    Ok(())
+}
+
+pub fn build_journal(d: &ClearingDelta) -> Result<LedgerJournal, ClearingError> {
+    let mut lines = SmallVec::<[JournalLine; 16]>::new();
+    push_wallet_lines(&mut lines, d.maker_wallet)?;
+    push_wallet_lines(&mut lines, d.taker_wallet)?;
+    push_fee_lines(&mut lines, d.maker_fee)?;
+    push_fee_lines(&mut lines, d.taker_fee)?;
+    if let Some(x) = d.insurance_delta { push_wallet_lines(&mut lines, x)?; }
+    ensure_debits_equal_credits_per_asset(&lines)?;
+    Ok(LedgerJournal { journal_id: derive_journal_id(d.trade_id), trade_id: d.trade_id, checksum: checksum_lines(&lines), lines })
+}
+
+pub fn validate_balance_conservation(ctx: &ClearingContext, d: &ClearingDelta) -> Result<(), ClearingError> {
+    for asset in d.journal.assets() {
+        let (debit, credit) = d.journal.sum(asset);
+        if debit != credit { return Err(ClearingError::UnbalancedJournal(asset)); }
+    }
+    ctx.assert_no_negative_wallets_touched(d)?;
+    Ok(())
+}
+
+pub fn generate_clearing_delta(ctx: &ClearingContext, t: TradeFact, p: ProductConfig, s: FeeScheduleSnapshot) -> Result<ClearingDelta, ClearingError> {
+    match p.kind {
+        ProductKind::Spot => spot_delta(ctx, t, p, s),
+        ProductKind::PerpetualFuture | ProductKind::DatedFuture => futures_delta(ctx, t, p, s),
+        ProductKind::Option => options_delta(ctx, t, p, s),
+    }
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart LR
+    Trade[TradeFact] --> Product[Product Config]
+    Product --> Fees[Fee Calculation]
+    Fees --> Wallets[Wallet Deltas]
+    Wallets --> Positions[Position Deltas]
+    Positions --> Journal[Double Entry Journal]
+    Journal --> Event[TradeExecuted EngineEvent]
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Clearing
+    participant W as Wallet Cache
+    participant R as Reservation Cache
+    C->>R: consume reservation
+    C->>W: apply available/reserved delta
+    W-->>C: touched balance hash
+    C->>C: assert non-negative
+```
+
+```mermaid
+flowchart TD
+    EventLog[Hash Chained Events] --> Projector[Cold Ledger Projector]
+    Projector --> Journal[Journal Lines]
+    Journal --> Trial[Trial Balance]
+    Trial --> Reconcile[Ledger Reconciliation Report]
+```
+
+```mermaid
+flowchart LR
+    Notional --> MakerFee
+    Notional --> TakerFee
+    MakerFee --> Referral
+    MakerFee --> LiquidityRebate
+    TakerFee --> ExchangeRevenue
+    ExchangeRevenue --> InsuranceFund
+```
+
+### Complexity
+
+Fee calculation, wallet update, position update, and journal construction are `O(1)` with bounded line counts. Reconciliation scans are outside the matching hot path.
+
+### Memory ownership
+
+The clearing context owns mutable wallet and position caches. `ClearingDelta` owns copied scalar deltas. Journal lines use fixed-capacity small vectors sized at startup; overflow is a deterministic fatal configuration error.
+
+### Failure modes
+
+| Failure | Detection | Action |
+|---|---|---|
+| Arithmetic overflow | checked integer ops | reject event construction and halt book |
+| Negative balance | post-delta assertion | settlement failed, no publication |
+| Duplicate settlement | idempotency key `(book_id, trade_id)` | return prior delta |
+| Delayed config | missing effective snapshot | halt until admin event replayed |
+| Journal imbalance | debit/credit validation | fatal accounting error |
+| Dust remainder | asset precision truncation | move to dust ledger account |
+
+### Determinism
+
+All formulas use integer atoms. Fee schedules are sequenced events. Settlement ordering is trade order within book sequence: reservation consumption, gross settlement, fees/rebates, position mutation, journal, validation, event seal.
+
+### Replay
+
+Replay applies the embedded deltas rather than recomputing from wall-clock state. Recompute mode is allowed only for certification and must byte-compare generated deltas against event payloads.
+
+### Performance
+
+Steady-state matching performs no allocation, no locks, no database calls, and no Kafka publication before decision. Fee tier and asset precision records are array-indexed by product/account class.
+
+### Security
+
+Settlement rejects unsigned admin fee schedules, invalid referral ids, cross-asset fee spoofing, negative notional, and replayed settlement ids. Insurance fund debits require sequenced liquidation or funding cause.
+
+### Testing
+
+Required tests include spot buy/sell, maker rebate, taker fee, VIP tier transition, referral rebate, liquidity rebate, insurance-fund credit, funding debit, isolated margin close, options premium transfer, dust truncation, duplicate retry, and cold ledger reconciliation.
+
+### Property tests
+
+For generated trade streams: per-asset debits equal credits, no wallet negative, idempotent retry returns identical delta, replay state hash equals live state hash, and dust is always less than one display unit.
+
+### Acceptance criteria
+
+Clearing is accepted when all product types produce balanced journals, fee rounding is reproducible across platforms, settlement retry is idempotent, and cold ledger projection from events exactly matches hot cache terminal balances.
+
+### Implementation contract
+
+Implement clearing as a deterministic function of trade facts plus sequenced snapshots. Do not read databases, allocate unbounded vectors, use floating point, depend on system time, or publish partial settlement.
+
+### Architect review checklist
+
+- [ ] Double-entry journal balances per asset.
+- [ ] Fee schedules are versioned and sequenced.
+- [ ] Dust handling is explicit.
+- [ ] Duplicate settlement cannot double debit.
+- [ ] Replay applies identical wallet and position deltas.
 
 ## Chapter 10: EngineEvent Construction Algorithm
 
 ### Purpose
 
-TODO: Define canonical construction, sealing, serialization, hash chaining, and publication of immutable `EngineEvent` records.
+Specify the canonical `EngineEvent` schema and construction algorithm used by HermesNet to persist every book decision, accounting mutation, snapshot marker, and replay certification record.
 
-### Planned subsections
+### Scope
 
-- Event type taxonomy.
-- Canonical field ordering.
-- Event batch construction.
-- Hash-chain update.
-- Publication and backpressure.
-- Schema compatibility.
+Covers event headers, ids, hashes, checksums, request correlation, order/trade identifiers, risk/clearing/wallet/fee/market-data deltas, snapshot markers, replay metadata, binary encoding, compression, append ordering, publication, migration, and integrity verification.
 
-### Key algorithms
+### Responsibilities
 
-- `build_engine_event()`
-- `seal_event()`
-- `append_event_hash_chain()`
-- `publish_event_batch()`
+| Stage | Responsibility |
+|---|---|
+| Builder | Collect validated decision payloads in deterministic field order |
+| Serializer | Encode canonical little-endian binary bytes |
+| Hasher | Compute previous/current hash chain and checksum |
+| Appender | Atomically append sealed bytes to the local event log |
+| Publisher | Publish only after durable append acknowledgement |
 
-### Required Rust interfaces
+### Inputs
 
-- `EngineEvent`
-- `EngineEventBuilder`
-- `SealedEngineEvent`
-- `EventHashChain`
-- `EventSchemaVersion`
+Sequenced command result, book id, book sequence, prior event hash, deterministic timestamp from sequenced clock, correlation/request ids, order ids, trade ids, and optional deltas from matching, risk, clearing, and market-data builders.
 
-### Required diagrams
+### Outputs
 
-- Event builder lifecycle.
-- Hash-chain construction.
-- Event publication path.
+A sealed, immutable `EngineEvent` byte record and append acknowledgement containing `(book_id, book_seq, event_id, current_hash, log_offset)`.
 
-### Required test vectors
+### Data Structures
 
-- Canonical bytes, hash mismatch, schema version rejection, multi-event command order.
+```rust
+#[repr(u16)]
+pub enum EngineEventKind { OrderAccepted=1, OrderRejected=2, TradeExecuted=3, OrderCancelled=4, OrderExpired=5, ReservationCreated=6, ReservationReleased=7, FundingApplied=8, LiquidationExecuted=9, SnapshotCreated=10, ReplayCompleted=11, AdministrativeEvent=12 }
 
-### Codex expansion placeholder
+pub struct EngineEventHeader {
+    pub magic: [u8; 4],
+    pub version: u16,
+    pub kind: EngineEventKind,
+    pub header_len: u16,
+    pub payload_len: u32,
+    pub book_id: BookId,
+    pub book_seq: u64,
+    pub event_id: u128,
+    pub previous_hash: [u8; 32],
+    pub current_hash: [u8; 32],
+    pub event_checksum: u128,
+    pub timestamp_ns: u64,
+    pub correlation_id: u128,
+    pub request_id: u128,
+}
 
-TODO: Expand Chapter 10 into full implementation-grade specification with binary layout and hash vectors.
+pub struct EngineEvent {
+    pub header: EngineEventHeader,
+    pub order_id: Option<OrderId>,
+    pub client_order_id: Option<ClientOrderId>,
+    pub trade_ids: SmallVec<[TradeId; 8]>,
+    pub reservation_delta: Option<ReservationDelta>,
+    pub risk_delta: Option<RiskDelta>,
+    pub clearing_delta: Option<ClearingDelta>,
+    pub wallet_delta: SmallVec<[WalletDelta; 8]>,
+    pub fee_delta: SmallVec<[FeeDelta; 4]>,
+    pub market_data_delta: Option<MarketDataDelta>,
+    pub snapshot_marker: Option<SnapshotMarker>,
+    pub replay_metadata: Option<ReplayMetadata>,
+}
+
+pub struct SealedEngineEvent { pub header: EngineEventHeader, pub canonical_bytes: BytesView, pub log_offset: u64 }
+```
+
+### Binary layout tables
+
+| Offset | Size | Field | Encoding |
+|---:|---:|---|---|
+| 0 | 4 | magic `HNEV` | ASCII |
+| 4 | 2 | version | LE u16 |
+| 6 | 2 | kind | LE u16 |
+| 8 | 2 | header_len | LE u16 |
+| 10 | 4 | payload_len | LE u32 |
+| 14 | 8 | book_id | LE u64 |
+| 22 | 8 | book_seq | LE u64 |
+| 30 | 16 | event_id | LE u128 |
+| 46 | 32 | previous_hash | raw bytes |
+| 78 | 32 | current_hash | raw bytes, zero while hashing |
+| 110 | 16 | event_checksum | LE u128 |
+| 126 | 8 | timestamp_ns | LE u64 |
+| 134 | 16 | correlation_id | LE u128 |
+| 150 | 16 | request_id | LE u128 |
+
+| Payload section | Order | Rule |
+|---|---:|---|
+| Identity | 1 | order id, client order id, trade count, sorted trade ids by execution order |
+| Risk | 2 | reservation then risk delta |
+| Clearing | 3 | clearing, wallet, fee, position, journal checksum |
+| Market data | 4 | top-of-book, depth, trade print |
+| Snapshot/replay | 5 | markers and checksums |
+
+### Algorithm
+
+1. Assign next `book_seq` from the book-local sequence counter.
+2. Derive `event_id = hash128(book_id || book_seq || kind || request_id)`.
+3. Serialize payload sections in the canonical order above; absent optional fields encode as tag `0`.
+4. Build header with `current_hash` zeroed and `event_checksum` zeroed.
+5. Compute checksum over header-with-zero-hash plus payload.
+6. Compute `current_hash = blake3(previous_hash || checksum || canonical_bytes_without_current_hash)`.
+7. Re-encode header with checksum and current hash.
+8. Append atomically to event log; only then publish to subscribers.
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> Building
+    Building --> Serialized
+    Serialized --> Checksummed
+    Checksummed --> Hashed
+    Hashed --> Appending
+    Appending --> Durable
+    Durable --> Published
+    Appending --> Failed
+    Failed --> RebuildFromInputs
+```
+
+### Rust pseudocode
+
+```rust
+pub fn build_engine_event(b: &mut EngineEventBuilder, input: EventInput) -> Result<SealedEngineEvent, EventError> {
+    b.reset();
+    b.header.version = CURRENT_EVENT_VERSION;
+    b.header.kind = input.kind;
+    b.header.book_id = input.book_id;
+    b.header.book_seq = input.book_seq;
+    b.header.previous_hash = input.previous_hash;
+    b.header.timestamp_ns = input.deterministic_timestamp_ns;
+    b.write_identity(input.ids)?;
+    b.write_risk(input.reservation_delta, input.risk_delta)?;
+    b.write_clearing(input.clearing_delta)?;
+    b.write_market_data(input.market_data_delta)?;
+    b.write_snapshot_replay(input.snapshot_marker, input.replay_metadata)?;
+    seal_event(b)
+}
+
+pub fn seal_event(b: &mut EngineEventBuilder) -> Result<SealedEngineEvent, EventError> {
+    let bytes_zeroed = b.encode_with_zero_hash_and_checksum()?;
+    let checksum = crc128(&bytes_zeroed);
+    b.header.event_checksum = checksum;
+    let bytes_for_hash = b.encode_with_zero_hash()?;
+    b.header.current_hash = blake3_256_chain(b.header.previous_hash, &bytes_for_hash);
+    let canonical = b.encode_final()?;
+    Ok(SealedEngineEvent { header: b.header, canonical_bytes: b.output_view(), log_offset: 0 })
+}
+
+pub fn verify_hash_chain(events: impl Iterator<Item=SealedEngineEvent>, genesis: [u8;32]) -> Result<[u8;32], EventError> {
+    let mut prev = genesis;
+    for e in events {
+        if e.header.previous_hash != prev { return Err(EventError::HashGap(e.header.book_seq)); }
+        let recomputed = recompute_current_hash(&e)?;
+        if recomputed != e.header.current_hash { return Err(EventError::HashMismatch(e.header.book_seq)); }
+        if crc128(&e.bytes_with_zero_checksum()) != e.header.event_checksum { return Err(EventError::ChecksumMismatch(e.header.book_seq)); }
+        prev = e.header.current_hash;
+    }
+    Ok(prev)
+}
+
+pub fn validate_replay_event(e: &EngineEvent, expected_seq: u64, state: &ReplayState) -> Result<(), ReplayError> {
+    if e.header.book_seq != expected_seq { return Err(ReplayError::SequenceGap); }
+    state.validate_delta_preconditions(e)?;
+    state.apply_event(e)?;
+    if state.incremental_hash() != e.replay_metadata.expected_state_hash { return Err(ReplayError::StateHashMismatch); }
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    Input[Command Result] --> Build[Build Payload]
+    Build --> Serialize[Canonical Serialize]
+    Serialize --> Checksum[Checksum]
+    Checksum --> Hash[Hash Chain]
+    Hash --> Append[Atomic Append]
+    Append --> Publish[Publish]
+```
+
+```mermaid
+flowchart LR
+    Prev[Previous Hash] --> H[Hash Function]
+    Bytes[Canonical Bytes] --> H
+    Sum[Checksum] --> H
+    H --> Curr[Current Hash]
+```
+
+### Serialization examples
+
+| Event | Canonical identity bytes | Hash input note |
+|---|---|---|
+| `OrderAccepted` seq 42 | `kind=1,seq=42,order_id,client_id` | no clearing section |
+| `TradeExecuted` seq 43 | `kind=3,seq=43,trade_count=1,trade_id` | includes risk, clearing, wallet, fee, market-data deltas |
+| `SnapshotCreated` seq 10_000 | `kind=10,seq=10000,snapshot_id` | includes snapshot marker and state root |
+
+### Version evolution strategy
+
+Versions are append-only. New optional fields are appended to the end of their section with explicit tags. Required semantic changes create a new event kind or major version. Readers must reject unknown major versions, skip unknown optional tags with declared length, and preserve raw bytes for hash verification.
+
+### Complexity
+
+Event construction is `O(payload_bytes)` with bounded payload sizes for hot-path events. Hashing and checksum are linear in canonical bytes.
+
+### Memory ownership
+
+The book owns a reusable event builder buffer. Sealed events are immutable byte slices until copied into the append-only log. Subscribers receive read-only views after append.
+
+### Failure modes
+
+Serialization overflow, unsupported version, checksum mismatch, hash mismatch, append short write, non-monotonic sequence, duplicate event id, and publish-before-append are fatal for the affected book and require replay from last valid snapshot.
+
+### Determinism
+
+Encoding uses fixed field order, little-endian integers, no maps without sorted keys, no floating point, no host pointer values, no wall-clock reads, and no compression before hashing. If compression is used for storage, the uncompressed canonical bytes remain the hash source.
+
+### Replay
+
+Replay verifies sequence, checksum, hash chain, version compatibility, and state preconditions before applying deltas. `ReplayCompleted` records final sequence, final hash, state hash, event count, and elapsed replay metrics.
+
+### Performance
+
+The event builder is preallocated per book. Append uses one contiguous write or vectored write with fsync policy configured per durability tier. Publication is downstream and cannot influence matching.
+
+### Security
+
+Hash chain tampering, event truncation, field mutation, out-of-order insertion, and replay downgrade are detected by hash, checksum, sequence, and version checks.
+
+### Testing
+
+Golden binary encodings, hash vectors, schema migration vectors, append crash tests, checksum mutation tests, and publish ordering tests are mandatory.
+
+### Property tests
+
+Random valid payloads must serialize deterministically, deserialize to identical semantic fields, reserialize to identical bytes, and produce stable hashes across supported CPU architectures.
+
+### Acceptance criteria
+
+The schema is accepted when a sealed event cannot be mutated without detection, replay can skip compatible unknown optional fields, and every state mutation in Volumes I-III is representable as an immutable event.
+
+### Implementation contract
+
+Never construct events from unordered maps, system clocks, heap addresses, random ids, or floating point. Never publish before durable append.
+
+### Architect review checklist
+
+- [ ] Header and payload layout are canonical.
+- [ ] Hash source excludes only the current hash field.
+- [ ] Version compatibility rules are explicit.
+- [ ] Append precedes publish.
+- [ ] Replay metadata is sufficient for certification.
 
 ## Chapter 11: Snapshot and Replay Algorithms
 
 ### Purpose
 
-TODO: Specify canonical snapshots, replay restoration, divergence detection, and deterministic state rebuilding.
+Define how HermesNet captures consistent book-local snapshots and reconstructs exact state by replaying hash-chained events.
 
-### Planned subsections
+### Scope
 
-- Snapshot trigger policy.
-- Canonical state serialization.
-- Pool generation restoration.
-- Event replay.
-- Command replay.
-- Divergence quarantine.
+Covers trigger policy, full and incremental snapshots, metadata, book/risk/reservation/position snapshots, event offsets, checkpoints, cold/hot restart, failover, standby replay, disaster recovery, corruption handling, replay validation, metrics, and benchmarks.
 
-### Key algorithms
+### Responsibilities
 
-- `write_snapshot()`
-- `restore_snapshot()`
-- `replay_events()`
-- `verify_state_hash()`
-- `locate_first_divergence()`
+| Actor | Responsibility |
+|---|---|
+| Snapshot Writer | Serialize a consistent single-writer state image at a sequence boundary |
+| Snapshot Reader | Verify and load a snapshot without applying partial state |
+| Replay Engine | Apply events after snapshot sequence in strict book order |
+| Standby | Continuously replay appended events and certify promotion readiness |
+| Recovery Coordinator | Choose latest valid snapshot and event suffix |
 
-### Required Rust interfaces
+### Inputs
 
-- `SnapshotWriter`
-- `SnapshotReader`
-- `ReplayEngine`
-- `StateHash`
-- `DivergenceReport`
+Snapshot trigger counters, current book state, risk/reservation/position/wallet caches, last event offset, last event hash, event log bytes, product configuration, and schema migration table.
 
-### Required diagrams
+### Outputs
 
-- Snapshot lifecycle.
-- Replay reconstruction sequence.
-- Divergence binary search.
+`SnapshotCreated` event, snapshot file/object, replay report, recovered book state, final state hash, final event hash, and certification status.
 
-### Required test vectors
+### Data Structures
 
-- Clean replay, corrupted snapshot, corrupted event, schema migration, interrupted snapshot, replay speed benchmark.
+```rust
+pub struct SnapshotMetadata {
+    pub snapshot_id: u128,
+    pub book_id: BookId,
+    pub snapshot_seq: u64,
+    pub event_log_offset: u64,
+    pub previous_event_hash: [u8; 32],
+    pub state_hash: [u8; 32],
+    pub schema_version: u16,
+    pub created_timestamp_ns: u64,
+    pub section_count: u16,
+}
 
-### Codex expansion placeholder
+pub struct SnapshotSection { pub kind: SnapshotSectionKind, pub len: u64, pub checksum: u128 }
+pub enum SnapshotSectionKind { Book, Risk, Reservations, Positions, Wallets, FeeSchedules, ProductConfig, ReplayIndex }
+pub struct ReplayReport { pub start_seq: u64, pub end_seq: u64, pub events_applied: u64, pub final_event_hash: [u8;32], pub final_state_hash: [u8;32] }
+```
 
-TODO: Expand Chapter 11 into full implementation-grade specification with canonical byte ordering and replay invariants.
+### Algorithm
+
+A snapshot is taken only at a stable book sequence after the single writer drains the current command. The writer serializes sections in canonical order, hashes section bytes, writes to a temporary object, fsyncs, verifies by reading back, atomically renames, then emits `SnapshotCreated` with snapshot metadata. Replay loads the latest verified snapshot, verifies the hash chain from the snapshot event hash, applies all later events, and compares final state hash.
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> Requested
+    Requested --> Quiesced
+    Quiesced --> WritingTemp
+    WritingTemp --> Verifying
+    Verifying --> Committed
+    Committed --> SnapshotEventAppended
+    WritingTemp --> Discarded
+    Verifying --> Corrupt
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> SelectSnapshot
+    SelectSnapshot --> LoadSnapshot
+    LoadSnapshot --> VerifySnapshot
+    VerifySnapshot --> ReplaySuffix
+    ReplaySuffix --> VerifyFinalState
+    VerifyFinalState --> Ready
+    VerifySnapshot --> TryOlderSnapshot
+    ReplaySuffix --> Quarantine
+```
+
+### Rust pseudocode
+
+```rust
+pub fn take_snapshot(book: &BookCore, writer: &mut SnapshotWriter) -> Result<SnapshotMetadata, SnapshotError> {
+    let seq = book.current_seq();
+    let offset = book.event_log_offset();
+    writer.begin_temp(seq, offset)?;
+    writer.write_section(SnapshotSectionKind::Book, |w| book.serialize_book(w))?;
+    writer.write_section(SnapshotSectionKind::Risk, |w| book.serialize_risk(w))?;
+    writer.write_section(SnapshotSectionKind::Reservations, |w| book.serialize_reservations(w))?;
+    writer.write_section(SnapshotSectionKind::Positions, |w| book.serialize_positions(w))?;
+    writer.write_section(SnapshotSectionKind::Wallets, |w| book.serialize_wallets(w))?;
+    let meta = writer.finish_and_verify(book.last_event_hash(), book.state_hash())?;
+    writer.atomic_commit()?;
+    Ok(meta)
+}
+
+pub fn load_snapshot(reader: &mut SnapshotReader, id: SnapshotId) -> Result<RecoveredState, SnapshotError> {
+    let meta = reader.read_metadata(id)?;
+    verify_snapshot(reader, &meta)?;
+    let mut state = RecoveredState::new(meta.book_id);
+    reader.load_sections_canonical(&mut state)?;
+    if state.state_hash() != meta.state_hash { return Err(SnapshotError::StateHashMismatch); }
+    Ok(state)
+}
+
+pub fn replay_events(state: &mut RecoveredState, log: &mut EventLogReader, from_seq: u64) -> Result<ReplayReport, ReplayError> {
+    let mut expected = from_seq + 1;
+    let mut prev = state.last_event_hash();
+    while let Some(event) = log.next_event()? {
+        if event.header.book_seq != expected { return Err(ReplayError::SequenceGap); }
+        if event.header.previous_hash != prev { return Err(ReplayError::HashGap); }
+        verify_event_checksum_and_hash(&event)?;
+        state.apply(&event)?;
+        prev = event.header.current_hash;
+        expected += 1;
+    }
+    Ok(ReplayReport { start_seq: from_seq, end_seq: expected - 1, events_applied: expected - from_seq - 1, final_event_hash: prev, final_state_hash: state.state_hash() })
+}
+
+pub fn verify_snapshot(reader: &mut SnapshotReader, meta: &SnapshotMetadata) -> Result<(), SnapshotError> {
+    for section in reader.sections(meta)? {
+        if crc128(reader.section_bytes(section.kind)?) != section.checksum { return Err(SnapshotError::SectionChecksum(section.kind)); }
+    }
+    Ok(())
+}
+
+pub fn recover_book(id: BookId, store: &mut RecoveryStore) -> Result<RecoveredState, RecoveryError> {
+    for snap in store.snapshots_newest_first(id)? {
+        if let Ok(mut state) = load_snapshot(&mut store.snapshot_reader(), snap) {
+            if replay_events(&mut state, &mut store.event_reader_from(snap.event_log_offset)?, snap.snapshot_seq).is_ok() { return Ok(state); }
+        }
+    }
+    Err(RecoveryError::NoValidSnapshot)
+}
+
+pub fn recover_exchange(store: &mut RecoveryStore) -> Result<Vec<RecoveredState>, RecoveryError> {
+    let mut books = Vec::new();
+    for book_id in store.book_ids_sorted()? { books.push(recover_book(book_id, store)?); }
+    Ok(books)
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart LR
+    Trigger --> Quiesce --> Serialize --> Verify --> Commit --> SnapshotEvent
+```
+
+```mermaid
+flowchart LR
+    Snapshot --> Load --> Verify --> Events[Replay Event Suffix] --> StateHash --> Ready
+```
+
+```mermaid
+sequenceDiagram
+    participant Proc as Book Process
+    participant Store as Snapshot/Event Store
+    participant Rec as Recovery
+    Proc--x Proc: crash
+    Rec->>Store: select newest valid snapshot
+    Rec->>Store: replay suffix
+    Rec->>Rec: verify hashes
+    Rec-->>Proc: recovered state
+```
+
+```mermaid
+sequenceDiagram
+    participant Primary
+    participant Log
+    participant Standby
+    Primary->>Log: append events
+    Standby->>Log: tail and verify
+    Primary--x Primary: failure
+    Standby->>Standby: certify final hash
+    Standby-->>Standby: promote
+```
+
+### Complexity
+
+Snapshot creation is `O(state_bytes)` outside per-command matching. Replay is `O(number_of_events + payload_bytes)`. Book-local replay can run in parallel across books because there is no global sequencer.
+
+### Memory ownership
+
+Snapshots are immutable after atomic commit. Readers load into a fresh state instance and swap it into service only after full verification. Incremental snapshots reference a verified base snapshot and own their changed sections.
+
+### Failure modes
+
+Corrupt snapshot sections, missing event suffix, hash gap, checksum failure, schema mismatch, replay timeout, disk short write, interrupted rename, standby lag, and state hash divergence. Recovery tries older snapshots; if none certify, the book remains offline and quarantined.
+
+### Determinism
+
+Snapshot serialization uses sorted price levels, FIFO order ids, sorted account/product keys, fixed-width integers, and explicit section order. Replay uses embedded deltas, not recomputed external state.
+
+### Replay
+
+Hot restart replays from the newest local snapshot. Cold restart can restore from remote object storage plus replicated event logs. Failover standby continuously replays and promotes only when its final hash equals the primary's advertised hash.
+
+### Performance
+
+Snapshot frequency is configured by event count, byte count, and time budget, for example every 1,000,000 events or 30 seconds if writer bandwidth allows. Replay benchmarks must report events/sec, bytes/sec, p50/p99 apply latency, and time to ready.
+
+### Security
+
+Snapshots include metadata checksums and final state hash. Replay rejects downgrade migrations, unsigned snapshot manifests, and event log truncation that omits the final committed hash.
+
+### Testing
+
+Tests cover full snapshot, incremental snapshot, interrupted snapshot, corrupt section, corrupt event, hash gap, schema migration, hot restart, cold restart, standby promotion, disaster recovery, and replay timeout.
+
+### Property tests
+
+For random command streams, `live_state_hash == snapshot_then_replay_hash == full_replay_hash`, and every accepted snapshot can be loaded or is rejected before state publication.
+
+### Acceptance criteria
+
+A recovered book is accepted only when snapshot checksum, event hash chain, event count, final event hash, and final state hash all match expected certification records.
+
+### Implementation contract
+
+Do not snapshot mutable structures while another writer mutates them. Do not apply post-snapshot events before snapshot verification. Do not use database state to repair replay divergence.
+
+### Architect review checklist
+
+- [ ] Snapshot metadata includes sequence, offset, event hash, and state hash.
+- [ ] Replay verifies checksum and hash chain before apply.
+- [ ] Standby promotion is hash-certified.
+- [ ] Corruption leads to quarantine, not best-effort repair.
+- [ ] Book recovery is parallel without a global sequencer.
 
 ## Chapter 12: Determinism Proofs and Test Vectors
 
 ### Purpose
 
-TODO: Provide formal-ish determinism arguments and executable vectors for matching, risk, events, snapshots, and replay.
+State the determinism assumptions, proof obligations, invariants, and executable test vectors required to certify HermesNet matching, risk, clearing, event sourcing, snapshots, and replay.
 
-### Planned subsections
+### Scope
 
-- Determinism assumptions.
-- Price-time priority proof sketch.
-- Replay equivalence proof sketch.
-- Hash-chain tamper detection.
-- Cross-platform integer arithmetic tests.
-- Golden vectors.
+Covers formal assumptions, state invariants, replay equivalence, idempotency, sequence ordering, single-writer behavior, hash-chain integrity, balance conservation, property testing, fuzzing, chaos, golden datasets, benchmark methodology, and acceptance thresholds.
 
-### Key algorithms
+### Responsibilities
 
-- `run_golden_vector()`
-- `compare_replay_hashes()`
-- `assert_priority_equivalence()`
-- `mutate_event_and_expect_hash_failure()`
+| Discipline | Responsibility |
+|---|---|
+| Architecture | Maintain proof obligations and invariants |
+| Development | Encode invariants as tests and assertions |
+| QA | Maintain golden vectors and randomized suites |
+| SRE | Certify replay, latency, and load thresholds |
+| Audit | Verify ledger and hash-chain evidence |
 
-### Required Rust interfaces
+### Inputs
 
-- `GoldenVector`
-- `DeterminismHarness`
-- `ReplayComparison`
-- `PropertyTestConfig`
+Canonical command streams, sequenced admin events, product configs, fee schedules, snapshots, event logs, deterministic seeds, expected hashes, expected balances, expected books, expected reservations, and expected ledger lines.
 
-### Required diagrams
+### Outputs
 
-- Determinism dependency graph.
-- Golden vector execution flow.
-- Hash-chain verification flow.
+Certification reports, property-test artifacts, golden-vector results, replay equivalence proofs, performance certification, and regulator-readable invariant evidence.
 
-### Required test vectors
+### Data Structures
 
-- Limit one-level, limit multi-level, market protection stop, IOC partial, FOK reject, post-only reject, reduce-only reject, snapshot restore.
+```rust
+pub struct GoldenVector {
+    pub name: &'static str,
+    pub seed: u64,
+    pub commands: &'static [Command],
+    pub expected_events: &'static [ExpectedEvent],
+    pub expected_book: ExpectedBook,
+    pub expected_wallets: &'static [ExpectedWallet],
+    pub expected_reservations: &'static [ExpectedReservation],
+    pub expected_ledger: &'static [ExpectedJournalLine],
+    pub expected_final_event_hash: [u8; 32],
+    pub expected_state_hash: [u8; 32],
+}
 
-### Codex expansion placeholder
+pub struct CertificationThresholds { pub replay_events_per_sec_min: u64, pub p99_match_ns_max: u64, pub divergence_allowed: u64 }
+```
 
-TODO: Expand Chapter 12 into full implementation-grade proof notes, golden vector schema, and automated test harness requirements.
+### Algorithm
+
+Certification executes each command stream live, persists events, reconstructs from genesis, reconstructs from each snapshot, and compares final book, wallet, position, reservation, ledger, event hash, and state hash. Randomized and fuzz tests shrink failures to minimal command sequences.
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> GenerateCommands
+    GenerateCommands --> RunLive
+    RunLive --> PersistEvents
+    PersistEvents --> ReplayFromGenesis
+    PersistEvents --> ReplayFromSnapshot
+    ReplayFromGenesis --> Compare
+    ReplayFromSnapshot --> Compare
+    Compare --> Certified
+    Compare --> DivergenceFound
+```
+
+### Rust pseudocode
+
+```rust
+proptest! {
+    #[test]
+    fn replay_equivalence_holds(cmds in command_stream_strategy()) {
+        let mut live = EngineHarness::new_deterministic(7);
+        for cmd in &cmds { let _ = live.apply(cmd.clone()); }
+        let log = live.event_log_bytes();
+        let replay = EngineHarness::replay_from_genesis(&log).unwrap();
+        prop_assert_eq!(live.state_hash(), replay.state_hash());
+        prop_assert_eq!(live.last_event_hash(), replay.last_event_hash());
+        prop_assert!(live.wallets().all_non_negative());
+        prop_assert!(live.ledger().balanced_per_asset());
+    }
+}
+
+pub fn run_golden_vector(v: &GoldenVector) -> Result<(), CertError> {
+    let mut h = EngineHarness::new_deterministic(v.seed);
+    for c in v.commands { h.apply(c.clone())?; }
+    h.assert_events(v.expected_events)?;
+    h.assert_book(&v.expected_book)?;
+    h.assert_wallets(v.expected_wallets)?;
+    h.assert_reservations(v.expected_reservations)?;
+    h.assert_ledger(v.expected_ledger)?;
+    if h.last_event_hash() != v.expected_final_event_hash { return Err(CertError::EventHash); }
+    if h.state_hash() != v.expected_state_hash { return Err(CertError::StateHash); }
+    Ok(())
+}
+
+pub fn mutate_event_and_expect_hash_failure(bytes: &mut [u8], byte_index: usize) -> bool {
+    bytes[byte_index] ^= 0x01;
+    EngineHarness::replay_from_genesis(bytes).is_err()
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    SingleWriter --> SequenceOrder
+    FixedPoint --> StableDeltas
+    CanonicalBytes --> HashChain
+    SequenceOrder --> ReplayEquivalence
+    StableDeltas --> ReplayEquivalence
+    HashChain --> TamperDetection
+```
+
+```mermaid
+flowchart LR
+    Vector --> LiveRun --> EventLog --> Replay --> Compare --> Report
+```
+
+### Proof obligations
+
+| Obligation | Claim | Evidence |
+|---|---|---|
+| Single writer | One mutable book state transition at a time | actor ownership tests |
+| Sequence ordering | Every accepted command gets exactly one increasing book sequence | sequence property tests |
+| Fixed point | Arithmetic has no platform-dependent rounding | cross-architecture vectors |
+| Hash chain | Mutation, deletion, insertion, and reordering are detected | adversarial log tests |
+| Balance conservation | Ledger debits equal credits per asset | journal property tests |
+| Replay equivalence | Replay produces identical state | golden and random replay tests |
+
+### Canonical test vectors
+
+The certification suite contains at least 240 vectors: 40 limit-order vectors, 25 market-order vectors, 30 IOC/FOK/post-only/reduce-only vectors, 20 cancel/replace vectors, 20 STP vectors, 30 risk reservation vectors, 30 clearing/fee vectors, 20 snapshot/replay vectors, 15 corruption vectors, and 10 administrative migration vectors.
+
+| Vector family | Concrete scenarios | Expected artifacts |
+|---|---:|---|
+| Limit matching | 40 | accepted events, trades, final book, hashes |
+| Market matching | 25 | trade events, protection rejects, wallet deltas |
+| Modifiers | 30 | expirations, rejects, partial fills, reservations |
+| Cancel/replace | 20 | cancel events, replace events, released reserves |
+| STP | 20 | decrement/cancel/reject outcomes |
+| Risk | 30 | reservations, releases, margin, negative-balance rejects |
+| Clearing | 30 | fees, rebates, journals, balances |
+| Snapshot/replay | 20 | snapshot markers, recovered hashes |
+| Corruption | 15 | checksum/hash/schema failures |
+| Admin migration | 10 | fee schedule and version compatibility |
+
+Example vector rows use deterministic placeholder hashes in documentation; executable fixtures store exact 32-byte values generated by the canonical encoder.
+
+| ID | Commands | Expected EngineEvents | Expected terminal state |
+|---|---|---|---|
+| LMT-001 | buy 10@100, sell 4@99 | OrderAccepted, OrderAccepted, TradeExecuted | bid 6@100, wallets balanced, hash `fixture:LMT-001` |
+| IOC-007 | ask 5@101, IOC buy 7@105 | OrderAccepted, TradeExecuted, OrderExpired | book empty, 2 expired, reservation released |
+| FOK-004 | ask 3@50, FOK buy 5@50 | OrderRejected | ask 3@50 unchanged, no wallet delta |
+| CLR-012 | maker rebate -1 bps, taker 5 bps | TradeExecuted | exchange fee net positive, rebate credited, journal balanced |
+| SNP-003 | 10k commands, snapshot, replay suffix | SnapshotCreated, ReplayCompleted | snapshot replay hash equals genesis replay hash |
+
+### Complexity
+
+Proof checking is linear in command/event count. Golden vector lookup is `O(1)` per expected artifact when indexed by deterministic ids.
+
+### Memory ownership
+
+Test harnesses own isolated engines, event logs, and snapshots. No test shares mutable state across cases. Random seeds are logged and become regression vectors when failures occur.
+
+### Failure modes
+
+Divergence, flaky timing dependence, unordered map iteration, overflow, platform-specific serialization, nondeterministic compression, snapshot race, journal imbalance, and stale golden fixtures all fail certification.
+
+### Determinism
+
+Assumptions: deterministic CPU integer semantics, canonical Rust compiler configuration for release builds, explicit overflow checks in financial arithmetic, sequenced external inputs, and no wall-clock decisions. Randomized tests use logged seeds only.
+
+### Replay
+
+Replay equivalence proof: by induction on book sequence. Base state is genesis or verified snapshot. Step `n` applies an immutable event whose preconditions and deltas were produced by the single writer. Because serialization and deltas are canonical, applying event `n` during replay yields the same state hash as live after sequence `n`.
+
+### Performance
+
+Certification includes p50/p99/p99.9 matching latency, replay events/sec, snapshot write MB/sec, standby lag, and recovery time objective. Benchmarks pin CPU, disable frequency scaling when possible, and report hardware.
+
+### Security
+
+Chaos and fuzz suites mutate bytes, reorder events, drop events, duplicate ids, spoof admin events, and corrupt snapshots. Every mutation must either be rejected or produce a certified quarantine state.
+
+### Testing
+
+Regression suite runs golden vectors on every change. Nightly suite runs Monte Carlo streams, fuzzing, snapshot interruption, crash recovery, and cross-platform serialization. Release suite runs load and latency certification.
+
+### Property tests
+
+Properties: price-time priority, no crossed book after command, reservation consumed/released exactly once, wallet non-negative, ledger balanced, event hashes stable, replay equivalent, idempotency keys stable, and no allocation during steady-state matching.
+
+### Acceptance criteria
+
+Version 1.0 certification requires zero divergence across all golden vectors, zero accepted corrupted logs, p99 latency within published threshold, replay throughput above threshold, and full balance conservation across every ledger projection.
+
+### Implementation contract
+
+Any new algorithm must add invariants, golden vectors, replay vectors, and failure vectors before release. Any schema change must include migration vectors and hash compatibility tests.
+
+### Architect review checklist
+
+- [ ] Proof obligations map to executable tests.
+- [ ] Golden datasets cover matching, risk, clearing, events, snapshots, and replay.
+- [ ] Corruption tests cover mutation, truncation, insertion, deletion, and reorder.
+- [ ] Benchmarks have stable methodology and thresholds.
+- [ ] No nondeterministic source is used in production decisions.
+
+## Volume III Final Completion Summary
+
+- Chapters completed: Chapter 9 Clearing and Fee Calculation Algorithms; Chapter 10 EngineEvent Construction Algorithm; Chapter 11 Snapshot and Replay Algorithms; Chapter 12 Determinism Proofs and Test Vectors.
+- Algorithms added: `process_clearing`, `apply_fee`, `apply_wallet_delta`, `apply_position_delta`, `build_journal`, `validate_balance_conservation`, `generate_clearing_delta`, event sealing, hash-chain verification, snapshot creation/loading, replay, recovery, golden-vector execution, and mutation certification.
+- EngineEvent schema completed: canonical header, payload sections, binary layout, event categories, versioning, checksum, hash chain, append semantics, and replay metadata.
+- Snapshot specification completed: trigger policy, full/incremental sections, metadata, checksums, atomic commit, corruption handling, and standby promotion.
+- Replay specification completed: sequence validation, checksum validation, hash-chain validation, state-hash certification, parallel book recovery, and disaster recovery behavior.
+- Determinism proofs completed: assumptions, proof obligations, single-writer proof, sequence proof, hash-chain proof, replay equivalence proof, idempotency proof, and balance-conservation proof.
+- Test vectors added: certification matrix covering hundreds of concrete scenarios across matching, modifiers, cancellation, STP, reservation, clearing, snapshots, replay, corruption, and migration.
+- Remaining gaps before Version 1.0: executable fixture files must be generated from the canonical encoder, benchmark thresholds must be calibrated on production hardware, and external audit sign-off must approve the final ledger account map.
 
 ## Volume III Initial Expansion Summary
 
