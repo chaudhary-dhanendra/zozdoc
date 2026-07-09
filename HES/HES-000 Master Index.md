@@ -1,0 +1,111 @@
+# HES-000 Master Index
+
+## 1. HES Title and Purpose
+
+**HermesNet Exchange Specification (HES)** is the canonical multi-volume technical specification for the HermesNet exchange system. It organizes the exchange architecture, trading core, deterministic execution model, wallet and ledger accounting, derivatives systems, market connectivity, operations, security, quality engineering, and engineering standards into independently maintainable volumes.
+
+The purpose of this master index is to provide navigation, status, dependency guidance, and Codex working rules for the HES repository.
+
+## 2. Document Classification
+
+- **Document family:** HermesNet Exchange Specification (HES)
+- **Document type:** Engineering specification repository
+- **Source of truth:** Markdown files in this `HES/` directory
+- **Generated artifacts:** DOCX and PDF exports are generated artifacts only and are not authoritative
+- **Audience:** Rust engineers, Codex agents, reviewers, SREs, security engineers, compliance stakeholders, and technical leadership
+
+## 3. How to Read the Specification
+
+Read HES as a layered exchange specification. Earlier frozen volumes define constraints that later volumes must not violate. Later planned or in-progress volumes may extend the system, but must preserve deterministic execution, fixed-point arithmetic, event sourcing, auditability, and hot-path isolation constraints established by Volumes I–IV.
+
+When editing, read the relevant volume first, then consult dependency volumes listed in the cross-volume dependency map. Do not rewrite frozen material except for corrections, clarifications, typo fixes, or approved amendments.
+
+## 4. Volume Map
+
+- [HES-001 Volume I.md](HES-001%20Volume%20I.md) — Foundation & Core Trading Infrastructure
+- [HES-002 Volume II.md](HES-002%20Volume%20II.md) — Trading Kernel Internals
+- [HES-003 Volume III.md](HES-003%20Volume%20III.md) — Algorithms & Deterministic Execution
+- [HES-004 Volume IV.md](HES-004%20Volume%20IV.md) — Wallet, Ledger & Financial Accounting
+- [HES-005 Volume V.md](HES-005%20Volume%20V.md) — Futures, Margin & Liquidation
+- [HES-006 Volume VI.md](HES-006%20Volume%20VI.md) — Market Data & Connectivity
+- [HES-007 Volume VII.md](HES-007%20Volume%20VII.md) — Operations, SRE & Infrastructure
+- [HES-008 Volume VIII.md](HES-008%20Volume%20VIII.md) — Security & Compliance
+- [HES-009 Volume IX.md](HES-009%20Volume%20IX.md) — Quality Engineering
+- [HES-010 Volume X.md](HES-010%20Volume%20X.md) — Engineering Standards
+
+## 5. Volume Status Table
+
+| Volume | Title | Status |
+|---|---|---|
+| Volume I | Foundation & Core Trading Infrastructure | Frozen |
+| Volume II | Trading Kernel Internals | Frozen |
+| Volume III | Algorithms & Deterministic Execution | Frozen |
+| Volume IV | Wallet, Ledger & Financial Accounting | Frozen |
+| Volume V | Futures, Margin & Liquidation | In Progress |
+| Volume VI | Market Data & Connectivity | Planned |
+| Volume VII | Operations, SRE & Infrastructure | Planned |
+| Volume VIII | Security & Compliance | Planned |
+| Volume IX | Quality Engineering | Planned |
+| Volume X | Engineering Standards | Planned |
+
+## 6. Frozen Volumes Note
+
+Volumes I–IV are frozen. Frozen means their technical contracts are stable and must not be casually rewritten. Corrections are allowed when they preserve intent, improve precision, fix contradictions, or repair formatting without deleting valid technical material.
+
+## 7. Remaining Volumes Roadmap
+
+- Complete Volume V futures, margin, liquidation, funding, insurance, and ADL material.
+- Expand Volume VI with external protocol and market-data connectivity specifications.
+- Expand Volume VII with production operations and SRE procedures.
+- Expand Volume VIII with security, compliance, and regulatory controls.
+- Expand Volume IX with quality-engineering and certification frameworks.
+- Expand Volume X with repository-wide engineering standards.
+
+## 8. Cross-Volume Dependency Map
+
+| Dependent Volume | Primary Dependencies | Notes |
+|---|---|---|
+| Volume II | Volume I | Kernel internals must preserve foundational hot-path and architecture constraints. |
+| Volume III | Volumes I–II | Algorithms implement deterministic behavior over the architecture and kernel internals. |
+| Volume IV | Volumes I–III | Wallet and ledger accounting consume deterministic trading events without blocking the hot path. |
+| Volume V | Volumes I–IV | Futures and margin extend spot trading, deterministic execution, and balanced accounting. |
+| Volume VI | Volumes I–V | Connectivity exposes trading and market-data behavior without weakening deterministic core guarantees. |
+| Volume VII | Volumes I–VI | Operations must deploy and observe the system while respecting hot/cold path separation. |
+| Volume VIII | Volumes I–VII | Security and compliance controls must integrate with infrastructure and accounting audit trails. |
+| Volume IX | Volumes I–VIII | Quality engineering validates every frozen and planned technical contract. |
+| Volume X | Volumes I–IX | Engineering standards govern implementation, review, release, and maintenance across all volumes. |
+
+## 9. Suggested Implementation Reading Order
+
+1. Volume I — establish architecture, invariants, and core infrastructure.
+2. Volume II — understand trading kernel internals.
+3. Volume III — implement deterministic algorithms and replay behavior.
+4. Volume IV — implement wallet, ledger, and accounting projections.
+5. Volume V — continue derivatives, margin, and liquidation work.
+6. Volume VI — implement connectivity and protocol surfaces.
+7. Volume IX — build testing and certification as implementation expands.
+8. Volume VII — productionize deployment and operations.
+9. Volume VIII — harden security and compliance.
+10. Volume X — enforce repository-wide engineering standards.
+
+## 10. Codex Working Rules
+
+- Edit only one HES volume at a time unless the task explicitly requires cross-volume coordination.
+- Preserve existing technical content, diagrams, Rust pseudocode, tables, summaries, and acceptance criteria.
+- Do not compress, summarize, or delete valid technical material during restructuring.
+- Treat DOCX and PDF outputs as generated artifacts, not source of truth.
+- Prefer narrow amendments over broad rewrites.
+- For frozen volumes, make only corrections or approved amendments.
+- Keep cross-references simple and avoid risky automated rewrites.
+
+## 11. Versioning Policy
+
+- Use semantic document versions for the HES repository: `MAJOR.MINOR.PATCH`.
+- Increment `PATCH` for typo fixes, formatting repairs, and non-semantic clarifications.
+- Increment `MINOR` for additive material that preserves existing contracts.
+- Increment `MAJOR` for approved contract-breaking amendments.
+- Record meaningful amendments in the affected volume and, when repository-wide, in this master index.
+
+## 12. Amendment Policy
+
+Amendments must identify the affected volume, reason for change, compatibility impact, and reviewer expectations. Frozen-volume amendments require extra scrutiny and must preserve deterministic execution, fixed-point accounting, auditability, and hot-path isolation unless an explicit governance decision supersedes prior constraints.
