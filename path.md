@@ -8052,3 +8052,1642 @@ TODO: Expand Chapter 10 into full implementation-grade specification with benchm
 3. Rust interfaces added: `GatewayService`, `AuthService`, `RateLimiter`, `IdempotencyStore`, `OrderNormalizer`, `RouterClient`, `PrivateStreamPublisher`, `InstrumentRouter`, `RouteTable`, `BookRoute`, `BookCoreHandle`, `RingWriter`, `RouteResolutionResult`, `InstrumentState`, `FailoverController`, `BookCore`, `BookState`, `OrderBook`, `PriceLevel`, `OrderNode`, `RiskCache`, `ReservationMap`, `EventBuffer`, `AppendOnlyLog`, and `SnapshotBuffer`.
 4. Remaining TODO chapters: Chapter 4 Order Book Data Structures, Chapter 5 Matching Engine Algorithms, Chapter 6 Risk Reservation Engine, Chapter 7 Clearing Pipeline Internals, Chapter 8 EngineEvent and Event Log Internals, Chapter 9 Snapshot and Replay Engine, and Chapter 10 Trading Kernel Performance Engineering.
 5. Known gaps: Chapters 4 through 10 still require full algorithmic expansion, exact binary/event schemas, benchmark commands, release-gate thresholds, and binding to automated test identifiers.
+
+# VOLUME III: ALGORITHMS & DETERMINISTIC EXECUTION
+
+Volume III converts the HermesNet architecture into implementation-ready algorithms for Rust engineers and Codex agents. The algorithms in this volume assume book-local ordering, a single-writer Book Core, fixed-point arithmetic, deterministic replay, immutable event sourcing, and no database, Kafka, cloud service, lock, heap allocation, floating point operation, or wall-clock dependency in the matching hot path.
+
+## Chapter 1: Algorithmic Design Principles
+
+### 1. Purpose
+
+Define the deterministic execution rules that every Book Core algorithm must obey. These rules make matching, risk reservation consumption, event construction, snapshotting, and replay equivalent across machines, compiler versions, and recovery paths.
+
+### 2. Scope
+
+This chapter covers algorithmic clocks, sequence monotonicity, fixed-point arithmetic, single-writer mutation, immutable `EngineEvent` records, price-time priority, tie-breaking, bounded execution, idempotency, hash-chain verification, replay equivalence, and Codex implementation constraints.
+
+### 3. Non-Goals
+
+- Define network protocols.
+- Define database schemas.
+- Define distributed consensus.
+- Define user-facing API behavior outside normalized command inputs.
+- Permit cross-book global sequencing.
+
+### 4. Algorithmic Requirements
+
+- Every book has an independent monotonic `BookSeq`.
+- `BookSeq` is the algorithmic clock for matching decisions.
+- Matching decisions must not read wall-clock time.
+- All monetary values use fixed-point integer types.
+- No `f32`, `f64`, `Decimal` backed by floating point, or implicit float conversion is permitted in trading decisions.
+- Only the Book Core writer mutates book state.
+- Matching loops must be bounded by available quantity, available price levels, or explicit scan limits.
+- Events are immutable after construction.
+- Replay of the same ordered input command stream and snapshot must produce byte-identical event payloads and hash-chain values.
+
+### 5. Inputs
+
+- Normalized commands ordered by the Instrument Router for a specific book.
+- Current Book Core state.
+- Current `BookSeq`.
+- Risk reservation records created before entering matching.
+- Instrument configuration: tick size, lot size, min quantity, max quantity, price bands, fee schedule identifier, and precision scale.
+
+### 6. Outputs
+
+- Mutated in-memory book state.
+- Immutable `EngineEvent` sequence.
+- Clearing and fee deltas emitted as deterministic event payload fields.
+- Reservation consume/release records.
+- Updated book-local hash-chain accumulator.
+
+### 7. Data Structures Used
+
+- `OrderBook`
+- `SideBook`
+- `PriceLevelMap`
+- `PriceLevel`
+- `OrderNode`
+- `OrderIdIndex`
+- `ClientOrderIdIndex`
+- `ReservationIndex`
+- `EventBuffer`
+- `SnapshotBuffer`
+
+### 8. Preconditions
+
+- Command has passed gateway normalization and static validation.
+- Instrument configuration is loaded into immutable book-local config.
+- Risk reservation exists when required by the command type.
+- Command is assigned to exactly one Book Core writer.
+- Existing snapshot, if replaying, has been hash-verified before command application.
+
+### 9. Postconditions
+
+- `BookSeq` increments exactly once for each accepted command that reaches Book Core processing, including deterministic rejections.
+- Each emitted event references the producing `BookSeq`.
+- No mutable event is retained after publication.
+- All indexes remain mutually consistent.
+- Any unused hold is released by event, not by hidden side effect.
+
+### 10. Invariants
+
+| Invariant | Required property | Check location |
+|---|---|---|
+| Book-local clock | `next_seq == previous_seq + 1` | command envelope processing |
+| Price-time priority | best price first, FIFO within level | match traversal |
+| Fixed-point arithmetic | checked integer math only | validation, matching, clearing |
+| Single writer | one mutable owner of book state | Book Core event loop |
+| Immutable events | event bytes never change after seal | event builder |
+| Idempotency | duplicate command maps to prior terminal result | gateway and book duplicate guard |
+| Bounded loops | loop bound is explicit and state-derived | match and scan functions |
+| Replay equivalence | replay output hash equals original hash | replay verifier |
+| Hash-chain continuity | `event_hash[n] = H(event_hash[n-1], event_bytes[n])` | event append |
+
+### 11. Step-by-Step Algorithm
+
+1. Receive a normalized command for one instrument.
+2. Resolve the command to a single Book Core mailbox without using a global sequencer.
+3. In the Book Core writer, reserve `seq = book_seq + 1`.
+4. Validate precision, tick, lot, side, time-in-force, and reservation linkage using integer arithmetic.
+5. Execute the command using deterministic traversal and explicit tie-breaking.
+6. Emit one or more immutable `EngineEvent` records ordered by construction sequence.
+7. Update indexes and price levels before exposing completion.
+8. Append events to the book-local event buffer and hash chain.
+9. Release unused reservations through explicit events.
+10. Commit `book_seq = seq`.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn apply_command(core: &mut BookCore, cmd: NormalizedCommand) -> ApplyResult {
+    let seq = core.seq.checked_add(1).expect("book seq overflow is fatal");
+    let mut events = EventBatch::new_in_place();
+
+    let result = match core.idempotency.lookup(cmd.command_id) {
+        Some(previous) => previous.to_apply_result(seq),
+        None => dispatch_command(core, seq, &cmd, &mut events),
+    };
+
+    for event in events.iter() {
+        let sealed = event.seal(seq, core.last_event_hash);
+        core.last_event_hash = sealed.hash;
+        core.event_buffer.push(sealed);
+    }
+
+    core.seq = seq;
+    result
+}
+
+fn checked_mul_price_qty(price: Price, qty: Qty) -> Result<QuoteQty, ArithmeticError> {
+    price.raw()
+        .checked_mul(qty.raw())
+        .and_then(|v| v.checked_div(SCALE_FACTOR))
+        .map(QuoteQty::from_raw)
+        .ok_or(ArithmeticError::Overflow)
+}
+```
+
+### 13. Complexity Analysis
+
+- Command dispatch: `O(1)`.
+- Best price lookup: `O(log P)` for `BTreeMap`, `O(1)` for a bounded ladder.
+- FIFO order traversal within a level: `O(F)` where `F` is the number of fills.
+- Event append: amortized `O(1)` with preallocated ring capacity.
+- Replay: `O(C + E)` for commands and events.
+
+### 14. Edge Cases
+
+- `BookSeq` overflow: stop book and emit fatal administrative alert outside hot path.
+- Quantity rounds to zero after lot validation: reject deterministically.
+- Price not divisible by tick: reject deterministically.
+- Duplicate client order identifier with different payload: reject as idempotency conflict.
+- Snapshot hash mismatch: quarantine snapshot and replay from earlier checkpoint.
+- Empty side book: rest eligible limit order or reject/expire market and IOC orders.
+
+### 15. Failure Modes
+
+- Arithmetic overflow: command rejection when local to command; fatal halt if it corrupts existing state.
+- Index divergence: fatal invariant failure, stop writer, require replay.
+- Event buffer full: stop accepting commands for that book until downstream catches up or snapshot/recovery policy is invoked.
+- Hash-chain mismatch during replay: halt replay and report first divergent sequence.
+
+### 16. Determinism Considerations
+
+| Operation class | Deterministic use | Nondeterministic use to avoid |
+|---|---|---|
+| Map traversal | `BTreeMap` ordered by integer price | `HashMap` iteration order |
+| Time | command ingress timestamp as payload only | `now()` for matching decisions |
+| Arithmetic | checked integer fixed-point | floating point rounding |
+| Sorting | stable sort with explicit key tuple | unstable sort with implicit ties |
+| Randomness | none in hot path | random tie-breaks |
+| Concurrency | one writer per book | shared mutable book with locks |
+
+### 17. Replay Considerations
+
+Replay must restore a snapshot, reapply commands in book-local order, reconstruct events, and compare event bytes and hash-chain values. Replay does not regenerate wall-clock timestamps for matching logic. Any timestamp in an event must come from the original command envelope or deterministic sequence metadata.
+
+### 18. Performance Considerations
+
+- Preallocate event batches to the maximum fills per command limit.
+- Use arena or pool allocation for orders and price levels.
+- Avoid heap allocation in the steady-state match loop.
+- Keep hot fields compact: side, price, remaining quantity, owner account, order id, and links.
+- Keep validation branches before matching so match loops are branch-light.
+
+### 19. Test Cases
+
+- Identical command stream replay produces identical event hashes.
+- Duplicate command returns prior terminal result without duplicate fills.
+- Tick-size rejection produces the same rejection event across replay.
+- Stable FIFO is preserved for same-price orders.
+- Event buffer saturation halts deterministically at the same sequence.
+
+### 20. Property-Based Tests
+
+- For any valid command stream, `book_seq` is strictly monotonic.
+- For any event stream, hash-chain verification detects single-bit mutation.
+- For any accepted order, total filled plus resting plus canceled equals original quantity.
+- For any replayed stream, final book state equals original state.
+
+### 21. Acceptance Criteria
+
+- No matching function imports time, randomness, thread synchronization, or floating point utilities.
+- All arithmetic paths use checked integer wrappers.
+- Every tie-break is expressed as `(price_priority, seq, order_id)` or stricter.
+- Replay verification can identify the first divergent event.
+
+### 22. Codex Implementation Contract
+
+- Do not introduce a global sequencer.
+- Do not use `HashMap` iteration to choose match order.
+- Do not add locks inside Book Core matching functions.
+- Do not allocate inside fill loops.
+- Do not use floats for price, quantity, notional, fee, or risk checks.
+- Do not mutate an `EngineEvent` after sealing.
+
+### 23. Review Checklist
+
+- [ ] Book-local sequence used as algorithmic clock.
+- [ ] Fixed-point wrappers used for all trading arithmetic.
+- [ ] All loops have explicit termination bounds.
+- [ ] Event construction is deterministic and immutable.
+- [ ] Replay path compares hashes and state.
+- [ ] No hot-path DB, Kafka, network, or cloud dependency.
+
+### Algorithmic Forbidden Operations
+
+| Forbidden operation | Reason | Replacement |
+|---|---|---|
+| `f32`/`f64` trading math | platform rounding divergence | checked fixed-point integers |
+| `SystemTime::now()` in matching | replay divergence | command metadata only |
+| Locking book levels during match | latency and interleaving risk | single-writer ownership |
+| Heap allocation in fill loop | tail latency | preallocated pools |
+| Unbounded recursion | stack and determinism risk | bounded iteration |
+| `HashMap` iteration for priority | randomized order | ordered map or explicit sorted keys |
+
+## Chapter 2: Order Book Data Structures
+
+### 1. Purpose
+
+Define the in-memory structures used by deterministic matching, indexing, event emission, reservation tracking, snapshots, and replay.
+
+### 2. Scope
+
+This chapter specifies `OrderBook`, `SideBook`, `PriceLevelMap`, `PriceLevel`, `OrderNode`, `OrderIdIndex`, `ClientOrderIdIndex`, `ReservationIndex`, `EventBuffer`, and `SnapshotBuffer`.
+
+### 3. Non-Goals
+
+- Persisted database schema.
+- Gateway request DTO schema.
+- External market data encoding.
+- Cross-instrument routing layout.
+
+### 4. Algorithmic Requirements
+
+- Best bid and best ask lookup must be deterministic.
+- FIFO order at a price level must be stable.
+- Order lookup by `OrderId` must not require scanning the book.
+- Client order id lookup must be deterministic and scoped by account and instrument.
+- Reservation state must be queryable by command id or order id.
+- Snapshot serialization order must be canonical.
+
+### 5. Inputs
+
+- Validated order commands.
+- Cancel/replace commands.
+- Reservation records.
+- Engine events to append.
+- Snapshot requests.
+
+### 6. Outputs
+
+- Mutated book structures.
+- Lookup results.
+- Snapshot buffers.
+- Replay-restored structures.
+
+### 7. Data Structures Used
+
+#### OrderBook
+
+- Purpose: own both sides, indexes, sequence, event hash, and buffers for one instrument.
+- Fields: `instrument_id`, `seq`, `bids`, `asks`, `orders`, `client_ids`, `reservations`, `events`, `snapshot`, `last_event_hash`.
+- Memory ownership: Book Core owns all mutable fields.
+- Mutation owner: single Book Core writer.
+- Access pattern: command dispatch reads indexes, matching mutates sides and nodes.
+- Complexity: best price depends on `PriceLevelMap`; id lookup `O(1)` average.
+- Invariants: every live `OrderNode` has exactly one side level and one `OrderIdIndex` entry.
+
+```rust
+struct OrderBook {
+    instrument_id: InstrumentId,
+    seq: BookSeq,
+    bids: SideBook,
+    asks: SideBook,
+    orders: OrderIdIndex,
+    client_ids: ClientOrderIdIndex,
+    reservations: ReservationIndex,
+    events: EventBuffer,
+    snapshot: SnapshotBuffer,
+    last_event_hash: EventHash,
+}
+```
+
+Testing notes: after each operation assert index counts equal live node counts and best bid is less than best ask unless crossed input is intentionally being processed inside a match function.
+
+#### SideBook
+
+- Purpose: maintain all price levels for one side.
+- Fields: `side`, `levels`, `total_resting_qty`, `level_count`.
+- Memory ownership: owned by `OrderBook`.
+- Mutation owner: Book Core writer.
+- Access pattern: best price traversal and level insertion/removal.
+- Complexity: `O(log P)` for map insert/remove with `BTreeMap`.
+- Invariants: bid best is max price; ask best is min price.
+
+```rust
+struct SideBook {
+    side: Side,
+    levels: PriceLevelMap,
+    total_resting_qty: Qty,
+    level_count: u32,
+}
+```
+
+#### PriceLevelMap
+
+- Purpose: deterministic map from fixed-point price to FIFO level.
+- Fields: `inner` as `BTreeMap<Price, PriceLevelId>` or custom ladder slots.
+- Memory ownership: map owns level handles; levels live in arena/pool.
+- Mutation owner: Book Core writer.
+- Access pattern: best level, insert level, remove empty level.
+- Complexity: `BTreeMap` best `O(log P)` or ladder best `O(1)` with bounded sparse cost.
+- Invariants: no empty level remains visible after command completion.
+
+```rust
+enum PriceLevelMap {
+    Tree(BTreeMap<Price, PriceLevelId>),
+    Ladder(FixedPriceLadder),
+}
+```
+
+#### PriceLevel
+
+- Purpose: FIFO queue of orders at one price.
+- Fields: `price`, `side`, `head`, `tail`, `len`, `total_qty`.
+- Memory ownership: allocated from level pool; links to order pool nodes.
+- Mutation owner: Book Core writer.
+- Access pattern: append at tail, consume/cancel from head or by node handle.
+- Complexity: append `O(1)`, head consume `O(1)`, remove by handle `O(1)` with intrusive links.
+- Invariants: `total_qty` equals sum of remaining quantities in chain.
+
+```rust
+struct PriceLevel {
+    price: Price,
+    side: Side,
+    head: Option<OrderHandle>,
+    tail: Option<OrderHandle>,
+    len: u32,
+    total_qty: Qty,
+}
+```
+
+#### OrderNode
+
+- Purpose: represent one live resting order.
+- Fields: order id, account id, side, price, original qty, remaining qty, reservation id, sequence, previous and next handles.
+- Memory ownership: order arena or object pool owns node storage.
+- Mutation owner: Book Core writer.
+- Access pattern: FIFO matching, cancel lookup, replace mutation.
+- Complexity: head match `O(1)`, indexed cancel `O(1)` after index lookup.
+- Invariants: if `remaining_qty == 0`, node must not remain linked at command completion.
+
+```rust
+struct OrderNode {
+    order_id: OrderId,
+    client_order_id: Option<ClientOrderId>,
+    account_id: AccountId,
+    side: Side,
+    price: Price,
+    original_qty: Qty,
+    remaining_qty: Qty,
+    reservation_id: ReservationId,
+    resting_seq: BookSeq,
+    prev: Option<OrderHandle>,
+    next: Option<OrderHandle>,
+}
+```
+
+#### OrderIdIndex
+
+- Purpose: direct lookup from order id to order handle.
+- Fields: `map: HashMap<OrderId, OrderHandle>`.
+- Ownership: owned by `OrderBook`; handles refer to order pool.
+- Mutation owner: Book Core writer.
+- Access pattern: cancel, replace, duplicate detection.
+- Complexity: average `O(1)`, never used for priority iteration.
+- Invariants: every index handle points to a live linked node.
+
+```rust
+struct OrderIdIndex {
+    map: HashMap<OrderId, OrderHandle>,
+}
+```
+
+#### ClientOrderIdIndex
+
+- Purpose: idempotency and duplicate client order id detection.
+- Fields: map from `(account_id, instrument_id, client_order_id)` to order or terminal result.
+- Complexity: average `O(1)` lookup.
+- Invariants: same key with different payload is conflict; same key with same payload returns prior result.
+
+```rust
+struct ClientOrderIdIndex {
+    map: HashMap<ClientOrderKey, ClientOrderRecord>,
+}
+```
+
+#### ReservationIndex
+
+- Purpose: track holds for accepted commands and resting orders.
+- Fields: `by_reservation_id`, `by_order_id`, consumed amount, released amount.
+- Invariants: `consumed + released <= reserved`.
+
+```rust
+struct ReservationIndex {
+    by_reservation_id: HashMap<ReservationId, ReservationRecord>,
+    by_order_id: HashMap<OrderId, ReservationId>,
+}
+```
+
+#### EventBuffer
+
+- Purpose: preallocated append-only book-local event staging and publication buffer.
+- Fields: ring slots, write cursor, sealed hash, capacity.
+- Invariants: events are appended in construction order and never mutated after seal.
+
+```rust
+struct EventBuffer {
+    slots: Box<[MaybeUninit<SealedEngineEvent>]>,
+    write_pos: u64,
+    capacity: usize,
+}
+```
+
+#### SnapshotBuffer
+
+- Purpose: canonical serialization workspace for deterministic snapshots.
+- Fields: byte buffer, schema version, high-water sequence, state hash.
+- Invariants: serialization traverses asks ascending, bids descending, FIFO per level.
+
+```rust
+struct SnapshotBuffer {
+    bytes: Vec<u8>,
+    schema_version: u16,
+    seq: BookSeq,
+    state_hash: StateHash,
+}
+```
+
+### 8. Preconditions
+
+- Pool capacities are initialized before trading starts.
+- Instrument tick and lot sizes are known.
+- Snapshot buffer schema matches current replay reader.
+
+### 9. Postconditions
+
+- Live order count equals order index length.
+- Empty price levels are removed.
+- Snapshot bytes are canonical for equivalent state.
+
+### 10. Invariants
+
+- Bids are traversed high-to-low.
+- Asks are traversed low-to-high.
+- FIFO is defined by `resting_seq`, then `order_id` only as defensive tie-break.
+- `HashMap` indexes are never used to derive priority.
+
+### 11. Step-by-Step Algorithm
+
+1. Validate incoming order fields.
+2. Allocate an `OrderNode` from the pool only if the order will rest.
+3. Insert or locate the deterministic price level.
+4. Append node to level tail.
+5. Insert `OrderIdIndex`, `ClientOrderIdIndex`, and `ReservationIndex` entries.
+6. Update side totals and level totals with checked arithmetic.
+7. On fill/cancel, unlink node, update totals, remove indexes, and return node to pool.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn append_resting_order(book: &mut OrderBook, order: RestingOrder) -> Result<OrderHandle, BookError> {
+    let side_book = book.side_mut(order.side);
+    let level_id = side_book.levels.get_or_insert(order.price, &mut book.level_pool)?;
+    let handle = book.order_pool.alloc(OrderNode::from_resting(order, book.seq))?;
+    book.level_pool[level_id].push_back(handle, &mut book.order_pool);
+    book.orders.insert(order.order_id, handle)?;
+    if let Some(client_id) = order.client_order_id {
+        book.client_ids.insert(order.client_key(client_id), ClientOrderRecord::Live(order.order_id))?;
+    }
+    Ok(handle)
+}
+```
+
+### 13. Complexity Analysis
+
+- Resting insertion: `O(log P)` with tree map plus `O(1)` FIFO append.
+- Cancel by id: `O(1)` index lookup plus `O(1)` unlink.
+- Snapshot: `O(P + N)` where `P` is levels and `N` is orders.
+
+### 14. Edge Cases
+
+- Level becomes empty after final fill: remove level before postcondition checks.
+- Pool exhaustion: reject rest operation before mutating indexes.
+- Duplicate order id: reject before allocation.
+- Client id collision: return prior result or conflict event.
+
+### 15. Failure Modes
+
+- Dangling handle in index: invariant failure requiring replay.
+- Side total underflow: fatal arithmetic invariant failure.
+- Snapshot buffer too small: grow outside hot path or fail snapshot, never matching.
+
+### 16. Determinism Considerations
+
+`BTreeMap` provides canonical price traversal. If a custom ladder is used, slot traversal order must be documented and independent of insertion order. `HashMap` may index by id but must not drive event order, matching order, or snapshot order.
+
+### 17. Replay Considerations
+
+Replay rebuilds pools, handles, and indexes from events. Handles are process-local and must not appear in event payloads. Snapshot serialization uses stable order so equivalent state produces identical bytes.
+
+### 18. Performance Considerations
+
+- Arena allocation improves cache locality and stable handles.
+- Intrusive links avoid `VecDeque` interior removal cost.
+- `VecDeque` is acceptable only when cancels by id do not require scanning.
+- Object pools avoid allocator jitter in the steady-state hot path.
+- Custom ladders can outperform `BTreeMap` when price bands are tight and tick count is bounded.
+
+### 19. Test Cases
+
+- Insert three orders at same price and verify FIFO handles.
+- Cancel middle order and verify head/tail links.
+- Fill entire level and verify level removal.
+- Snapshot, restore, and compare canonical state hash.
+- Duplicate client id conflict returns deterministic rejection.
+
+### 20. Property-Based Tests
+
+- Random insert/cancel/fill operations preserve index/live-node equality.
+- Snapshot followed by restore preserves best bid, best ask, totals, and FIFO order.
+- Total level quantity equals sum of node quantities after every command.
+
+### 21. Acceptance Criteria
+
+- No priority decision depends on unordered map iteration.
+- All structures document owner and mutation rules.
+- Steady-state matching does not allocate.
+- Snapshot order is canonical.
+
+### 22. Codex Implementation Contract
+
+Implement indexes for lookup only, not priority. Use explicit side traversal helpers: `best_bid_mut`, `best_ask_mut`, `next_worse_bid`, and `next_worse_ask`. Do not expose mutable references outside the Book Core writer.
+
+### 23. Review Checklist
+
+- [ ] Live node count equals order index count.
+- [ ] Empty levels removed.
+- [ ] Pool exhaustion handled before partial mutation.
+- [ ] Snapshot ordering documented and tested.
+
+### Data Structure Diagrams
+
+```mermaid
+graph TD
+    OB[OrderBook] --> Bids[SideBook bids]
+    OB --> Asks[SideBook asks]
+    OB --> OI[OrderIdIndex]
+    OB --> CI[ClientOrderIdIndex]
+    OB --> RI[ReservationIndex]
+    OB --> EB[EventBuffer]
+    OB --> SB[SnapshotBuffer]
+    Bids --> BPM[PriceLevelMap high-to-low]
+    Asks --> APM[PriceLevelMap low-to-high]
+    BPM --> BL[PriceLevel]
+    APM --> AL[PriceLevel]
+    BL --> BN[OrderNode chain]
+    AL --> AN[OrderNode chain]
+```
+
+```mermaid
+graph LR
+    H[head] --> O1[OrderNode seq 11]
+    O1 --> O2[OrderNode seq 15]
+    O2 --> O3[OrderNode seq 18]
+    O3 --> T[tail]
+```
+
+```mermaid
+graph TD
+    Cmd[Cancel order_id] --> Idx[OrderIdIndex]
+    Idx --> Handle[OrderHandle]
+    Handle --> Node[OrderNode]
+    Node --> Level[PriceLevel]
+    Level --> Unlink[O(1) unlink]
+```
+
+### Tradeoff Summary
+
+| Choice | Advantage | Cost | Deterministic rule |
+|---|---|---|---|
+| `BTreeMap` | canonical ordered traversal | `O(log P)` | safe default |
+| custom ladder | fast bounded best-price lookup | more complex sparse handling | allowed only with canonical slot order |
+| `VecDeque` | simple FIFO | middle cancel can scan | avoid for active cancel-heavy books |
+| intrusive list | `O(1)` unlink | handle safety complexity | preferred for matching core |
+| arena pool | stable handles and locality | capacity management | preferred hot path |
+| heap allocation | easy implementation | latency jitter | forbidden in steady-state matching |
+
+## Chapter 3: Limit Order Matching Algorithm
+
+### 1. Purpose
+
+Specify deterministic processing of buy and sell limit orders, including crossing, fills, resting remainders, fee and clearing hooks, reservation consumption and release, and event construction.
+
+### 2. Scope
+
+Covers plain Good-Till-Cancel limit orders. IOC, FOK, post-only, and reduce-only modifiers are specified in Chapter 5.
+
+### 3. Non-Goals
+
+- Market order matching.
+- Cross-book routing.
+- External clearing settlement.
+- Fee schedule design beyond deterministic hook invocation.
+
+### 4. Algorithmic Requirements
+
+- Buy limit crosses asks when `best_ask <= buy_limit_price`.
+- Sell limit crosses bids when `best_bid >= sell_limit_price`.
+- Match best price first, FIFO within price.
+- Execution price is resting maker order price.
+- Partial fills reduce remaining quantities with checked subtraction.
+- Remainder rests only if order policy permits.
+- Maker/taker roles are explicit in each fill event.
+- Risk hold is consumed for executed notional and released for unfilled non-resting quantity.
+
+### 5. Inputs
+
+- `LimitOrderCommand` with side, price, quantity, account, order ids, reservation id, and flags.
+- `OrderBook` state.
+- Instrument config.
+
+### 6. Outputs
+
+- `OrderAccepted`, `TradeExecuted`, `OrderRested`, `OrderFilled`, `OrderPartiallyFilled`, `OrderRejected`, and reservation events as applicable.
+
+### 7. Data Structures Used
+
+`OrderBook`, `SideBook`, `PriceLevel`, `OrderNode`, `ReservationIndex`, `EventBuffer`, fee calculator hook, and clearing delta hook.
+
+### 8. Preconditions
+
+- Price aligns to tick.
+- Quantity aligns to lot and is positive.
+- Reservation covers maximum required exposure.
+- Client order id is not conflicting.
+
+### 9. Postconditions
+
+- No crossed book remains after command completion.
+- Incoming quantity equals filled plus rested plus canceled/rejected quantity.
+- Fully filled maker nodes are removed from indexes and pools.
+- Remainder, if rested, is indexed and linked at tail.
+
+### 10. Invariants
+
+- Execution price never equals incoming price unless resting price equals incoming price.
+- FIFO within a price level is never skipped.
+- Book totals match node sums after each command.
+- Fee and clearing deltas are derived from fill quantity and execution price using fixed-point math.
+
+### 11. Step-by-Step Algorithm
+
+1. Reserve `seq` for the command.
+2. Validate tick, lot, side, price bands, and reservation.
+3. Emit deterministic acceptance or rejection event.
+4. For buy, iterate asks from lowest price while `ask_price <= limit_price` and incoming remains.
+5. For sell, iterate bids from highest price while `bid_price >= limit_price` and incoming remains.
+6. At each maker head, execute `min(incoming_remaining, maker_remaining)`.
+7. Calculate notional, fee hook result, clearing delta hook result, and reservation consumption.
+8. Emit trade event before unlinking the maker from externally visible indexes.
+9. If maker remaining is zero, unlink and remove maker indexes.
+10. If incoming remains and can rest, append to own side at tail.
+11. Release unused holds not backing fills or resting exposure.
+12. Validate post-match invariants.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn process_limit_order(book: &mut OrderBook, cmd: LimitOrderCommand) -> ApplyResult {
+    if !valid_tick(cmd.price) { return reject(book, cmd, RejectReason::InvalidTick); }
+    if !valid_lot(cmd.qty) { return reject(book, cmd, RejectReason::InvalidLot); }
+    if !book.reservations.covers_limit(&cmd) {
+        return reject(book, cmd, RejectReason::InsufficientReservation);
+    }
+
+    let mut incoming = IncomingOrder::from_limit(cmd);
+    book.events.push_accept(incoming.order_id);
+
+    match incoming.side {
+        Side::Buy => match_buy_limit(book, &mut incoming),
+        Side::Sell => match_sell_limit(book, &mut incoming),
+    }?;
+
+    if incoming.remaining_qty > Qty::ZERO {
+        rest_remaining(book, incoming)?;
+    } else {
+        book.events.push_filled(incoming.order_id);
+    }
+
+    validate_book_invariants(book)?;
+    ApplyResult::accepted()
+}
+
+fn match_buy_limit(book: &mut OrderBook, incoming: &mut IncomingOrder) -> Result<(), BookError> {
+    while incoming.remaining_qty > Qty::ZERO {
+        let Some(best_ask) = book.asks.best_price() else { break; };
+        if !can_cross(Side::Buy, incoming.limit_price, best_ask) { break; }
+        consume_best_level(book, Side::Buy, incoming)?;
+    }
+    Ok(())
+}
+
+fn match_sell_limit(book: &mut OrderBook, incoming: &mut IncomingOrder) -> Result<(), BookError> {
+    while incoming.remaining_qty > Qty::ZERO {
+        let Some(best_bid) = book.bids.best_price() else { break; };
+        if !can_cross(Side::Sell, incoming.limit_price, best_bid) { break; }
+        consume_best_level(book, Side::Sell, incoming)?;
+    }
+    Ok(())
+}
+
+fn can_cross(side: Side, incoming_limit: Price, resting_price: Price) -> bool {
+    match side {
+        Side::Buy => resting_price <= incoming_limit,
+        Side::Sell => resting_price >= incoming_limit,
+    }
+}
+
+fn execute_trade(book: &mut OrderBook, incoming: &mut IncomingOrder, maker: OrderHandle) -> Result<(), BookError> {
+    let maker_node = book.order_pool.get_mut(maker);
+    let fill_qty = incoming.remaining_qty.min(maker_node.remaining_qty);
+    let exec_price = maker_node.price;
+    let notional = checked_mul_price_qty(exec_price, fill_qty)?;
+    let fees = book.fee_hook.calculate(incoming.account_id, maker_node.account_id, notional, fill_qty)?;
+    let clearing = book.clearing_hook.delta(incoming, maker_node, exec_price, fill_qty)?;
+
+    book.reservations.consume_for_fill(incoming.reservation_id, notional)?;
+    incoming.remaining_qty = incoming.remaining_qty.checked_sub(fill_qty)?;
+    maker_node.remaining_qty = maker_node.remaining_qty.checked_sub(fill_qty)?;
+
+    book.events.push_trade(TradeEvent {
+        taker_order_id: incoming.order_id,
+        maker_order_id: maker_node.order_id,
+        price: exec_price,
+        qty: fill_qty,
+        maker_account: maker_node.account_id,
+        taker_account: incoming.account_id,
+        fees,
+        clearing,
+    });
+
+    if maker_node.remaining_qty == Qty::ZERO {
+        unlink_filled_maker(book, maker)?;
+    }
+    Ok(())
+}
+
+fn rest_remaining(book: &mut OrderBook, incoming: IncomingOrder) -> Result<(), BookError> {
+    let resting = RestingOrder::from_incoming(incoming);
+    append_resting_order(book, resting)?;
+    book.events.push_rested(resting.order_id, resting.price, resting.remaining_qty);
+    Ok(())
+}
+
+fn validate_book_invariants(book: &OrderBook) -> Result<(), BookError> {
+    ensure_indexes_match_live_nodes(book)?;
+    ensure_no_empty_levels(book)?;
+    ensure_not_crossed(book)?;
+    Ok(())
+}
+```
+
+### 13. Complexity Analysis
+
+`O(log P + F)` for best-level discovery and `F` fills when the best price pointer is maintained; `O(L log P + F)` if each emptied level removal requires tree operations across `L` levels.
+
+### 14. Edge Cases
+
+- Incoming exactly fills maker: maker removed, incoming continues only if quantity remains.
+- Incoming partially fills maker: maker remains at head with reduced quantity.
+- Incoming partially fills and rests: incoming node appended at its limit price.
+- Same account on both sides: defer to self-trade prevention policy before trade execution.
+- Fee overflow: reject before mutation if detected in preflight; fatal if detected after mutation path assumptions fail.
+
+### 15. Failure Modes
+
+- Invalid tick: emit rejection and do not mutate book.
+- Insufficient reservation: emit rejection and do not mutate book.
+- Pool exhaustion for resting remainder: if possible preflight before matching; otherwise require policy to cancel remainder rather than roll back fills.
+- Invariant failure: halt book and require replay.
+
+### 16. Determinism Considerations
+
+Best-price traversal is side-defined. FIFO is the linked-list order. Execution price is always maker price. Fee and clearing hooks must be pure functions of event inputs and immutable configuration.
+
+### 17. Replay Considerations
+
+Replay applies the same command at the same `BookSeq` and must produce the same trade sequence. Event payloads include maker order id, taker order id, fill quantity, execution price, fees, clearing deltas, and reservation deltas so replay can verify rather than infer externally.
+
+### 18. Performance Considerations
+
+- Preflight rest allocation capacity before matching if rollback is not supported.
+- Use mutable handles to head maker nodes.
+- Remove empty levels immediately after head chain empties.
+- Avoid constructing heap `Vec<Fill>`; write events into preallocated event batch.
+
+### 19. Test Cases
+
+1. Buy limit crosses one ask: ask 100 qty 5, buy 101 qty 5 yields one fill at 100 and removes ask.
+2. Buy limit crosses multiple asks: asks 100 qty 2 and 101 qty 3, buy 101 qty 5 fills in price order.
+3. Sell limit partially fills: bid 99 qty 10, sell 99 qty 4 leaves bid qty 6.
+4. Non-marketable limit rests: best ask 105, buy 100 qty 7 rests at bid 100.
+5. Tick rejection: buy price not divisible by tick emits invalid tick rejection.
+6. Insufficient reservation: buy notional exceeds quote hold emits insufficient reservation rejection.
+
+### 20. Property-Based Tests
+
+- Fill conservation: incoming original equals filled plus rested plus canceled.
+- Price priority: no worse price fills before better price.
+- FIFO priority: for equal prices, lower resting sequence fills first.
+- No crossed book after any accepted limit order.
+- Replay hash equality for randomly generated valid limit streams.
+
+### 21. Acceptance Criteria
+
+- Pseudocode maps to Rust without hidden global state.
+- Maker/taker role is explicit in trade events.
+- Reservation consume/release is event-backed.
+- Post-match invariants run in tests and debug builds.
+
+### 22. Codex Implementation Contract
+
+Do not sort matched orders after collection. Match in traversal order and emit events immediately into a preallocated batch. Do not use floats for notional or fee. Do not rest an order before all marketable quantity is consumed.
+
+### 23. Review Checklist
+
+- [ ] Buy crossing uses `ask <= limit`.
+- [ ] Sell crossing uses `bid >= limit`.
+- [ ] Execution price is maker price.
+- [ ] Full and partial fills update indexes correctly.
+- [ ] Resting remainder is tail-appended.
+- [ ] Invalid tick and reservation rejection do not mutate book.
+
+## Chapter 4: Market Order Matching Algorithm
+
+### 1. Purpose
+
+Specify deterministic market order execution against available liquidity with price protection, slippage guards, quote budget handling, and no resting market orders.
+
+### 2. Scope
+
+Covers market buys and market sells. Market order unfilled quantity expires with IOC-like semantics.
+
+### 3. Non-Goals
+
+- Synthetic market-to-limit order types.
+- External smart order routing.
+- Hidden liquidity.
+
+### 4. Algorithmic Requirements
+
+- Market buy consumes asks from lowest to highest price.
+- Market sell consumes bids from highest to lowest price.
+- Empty opposite side rejects before mutation.
+- Price protection caps executable prices.
+- Unfilled quantity never rests.
+- Market buy must respect quote budget and risk pre-reservation.
+- Traversal is deterministic and bounded by liquidity, quantity, quote budget, or protection price.
+
+### 5. Inputs
+
+- `MarketOrderCommand` with side, quantity or quote budget, account, reservation id, and protection parameters.
+- Opposite side book state.
+- Instrument config.
+
+### 6. Outputs
+
+- Acceptance/rejection event.
+- Trade events.
+- Expire/cancel remainder event.
+- Reservation consume/release events.
+
+### 7. Data Structures Used
+
+`OrderBook`, opposite `SideBook`, `PriceLevel`, `OrderNode`, `ReservationIndex`, `EventBuffer`, fee hook, clearing hook.
+
+### 8. Preconditions
+
+- Quantity or quote budget is positive and lot-aligned where applicable.
+- Market buy quote reservation exists.
+- Price protection limit is derived before matching using deterministic input metadata and config.
+
+### 9. Postconditions
+
+- Market order has no resting node.
+- Filled plus expired equals original base quantity, or consumed quote plus released quote equals reserved quote budget.
+- Opposite side remains ordered and index-consistent.
+
+### 10. Invariants
+
+- A market buy never executes above protection price.
+- A market sell never executes below protection price.
+- Quote budget is never negative.
+- Fully consumed maker nodes are removed.
+
+### 11. Step-by-Step Algorithm
+
+1. Validate market order quantity, budget, reservation, and protection fields.
+2. If opposite side is empty, reject without mutation.
+3. Emit acceptance event.
+4. Traverse best opposite prices deterministically.
+5. Stop when quantity is filled, budget is exhausted, protection would be breached, or liquidity ends.
+6. For each maker head, compute max fill constrained by remaining quantity and quote budget.
+7. Execute trade at maker price; consume reservation; emit fee and clearing deltas.
+8. Remove filled makers and empty levels.
+9. Expire any unfilled market quantity and release unused hold.
+10. Validate invariants.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn process_market_order(book: &mut OrderBook, cmd: MarketOrderCommand) -> ApplyResult {
+    if opposite_side(book, cmd.side).is_empty() {
+        return reject(book, cmd, RejectReason::NoLiquidity);
+    }
+    enforce_market_preconditions(book, &cmd)?;
+    let mut incoming = IncomingMarket::from(cmd);
+    book.events.push_accept(incoming.order_id);
+
+    match incoming.side {
+        Side::Buy => match_market_buy(book, &mut incoming)?,
+        Side::Sell => match_market_sell(book, &mut incoming)?,
+    }
+
+    finalize_market_result(book, incoming)?;
+    validate_book_invariants(book)?;
+    ApplyResult::accepted()
+}
+
+fn match_market_buy(book: &mut OrderBook, incoming: &mut IncomingMarket) -> Result<(), BookError> {
+    while incoming.remaining_qty > Qty::ZERO {
+        let Some(best_ask) = book.asks.best_price() else { break; };
+        if !enforce_price_protection(Side::Buy, best_ask, incoming.protection_price) { break; }
+        if incoming.remaining_quote_budget == QuoteQty::ZERO { break; }
+        consume_liquidity(book, incoming, best_ask)?;
+    }
+    Ok(())
+}
+
+fn match_market_sell(book: &mut OrderBook, incoming: &mut IncomingMarket) -> Result<(), BookError> {
+    while incoming.remaining_qty > Qty::ZERO {
+        let Some(best_bid) = book.bids.best_price() else { break; };
+        if !enforce_price_protection(Side::Sell, best_bid, incoming.protection_price) { break; }
+        consume_liquidity(book, incoming, best_bid)?;
+    }
+    Ok(())
+}
+
+fn enforce_price_protection(side: Side, price: Price, protection: Price) -> bool {
+    match side {
+        Side::Buy => price <= protection,
+        Side::Sell => price >= protection,
+    }
+}
+
+fn consume_liquidity(book: &mut OrderBook, incoming: &mut IncomingMarket, price: Price) -> Result<(), BookError> {
+    let maker = book.opposite_head(incoming.side, price).ok_or(BookError::Invariant)?;
+    let maker_remaining = book.order_pool[maker].remaining_qty;
+    let mut fill_qty = incoming.remaining_qty.min(maker_remaining);
+
+    if incoming.side == Side::Buy {
+        fill_qty = cap_by_quote_budget(fill_qty, price, incoming.remaining_quote_budget)?;
+        if fill_qty == Qty::ZERO { return Ok(()); }
+    }
+
+    execute_trade(book, incoming.as_limit_like(), maker)?;
+    if incoming.side == Side::Buy {
+        let notional = checked_mul_price_qty(price, fill_qty)?;
+        incoming.remaining_quote_budget = incoming.remaining_quote_budget.checked_sub(notional)?;
+    }
+    Ok(())
+}
+
+fn finalize_market_result(book: &mut OrderBook, incoming: IncomingMarket) -> Result<(), BookError> {
+    if incoming.filled_qty == Qty::ZERO {
+        book.events.push_expired(incoming.order_id, incoming.remaining_qty, ExpireReason::NoExecutableLiquidity);
+    } else if incoming.remaining_qty > Qty::ZERO {
+        book.events.push_expired(incoming.order_id, incoming.remaining_qty, ExpireReason::MarketRemainder);
+    } else {
+        book.events.push_filled(incoming.order_id);
+    }
+    book.reservations.release_unused(incoming.reservation_id)?;
+    Ok(())
+}
+```
+
+### 13. Complexity Analysis
+
+`O(L + F)` where `L` is consumed price levels and `F` is maker fills. Empty-book rejection is `O(1)`.
+
+### 14. Edge Cases
+
+- Empty opposite book: reject.
+- Quantity remains after liquidity exhausted: expire remainder.
+- Protection price blocks best level: expire without trade if no prior fill, or partial-fill then expire.
+- Quote budget cannot buy one lot at best ask: expire remainder and release budget.
+- Maker fee rebate or taker fee changes quote budget only through deterministic fee policy, not floating math.
+
+### 15. Failure Modes
+
+- Quote budget underflow: reject before mutation if detected in preflight; otherwise invariant failure.
+- Protection price invalid for side: reject.
+- Liquidity disappears cannot happen inside single writer; if replay differs, hash mismatch identifies divergence.
+
+### 16. Determinism Considerations
+
+Market orders do not use arrival wall-clock time for slippage. Protection values are command fields or deterministic config outputs. Best-price traversal is canonical.
+
+### 17. Replay Considerations
+
+Replay must reproduce stop conditions: no liquidity, protection breach, exhausted quote budget, or filled quantity. Expire reason is included in events to avoid ambiguity.
+
+### 18. Performance Considerations
+
+- Keep quote budget as raw integer quote units.
+- Avoid scanning beyond protection limit.
+- Avoid precomputing full available liquidity unless required by FOK; market orders can consume incrementally.
+
+### 19. Test Cases
+
+1. Market buy fully fills against ask levels until requested quantity is zero.
+2. Market sell partially fills when bid liquidity is insufficient and expires remainder.
+3. Empty book market order rejects with no mutation.
+4. Market buy stops before ask above protection limit and expires remainder.
+5. Market buy quote budget exhausted at best ask and releases unused reservation dust.
+
+### 20. Property-Based Tests
+
+- Market orders never create resting orders.
+- Executions never breach protection price.
+- Quote budget never goes negative.
+- Fill sequence follows best price then FIFO.
+- Replay of market streams produces identical expire reasons.
+
+### 21. Acceptance Criteria
+
+- Empty-book rejection occurs before mutation.
+- No market remainder rests.
+- Protection and budget stop conditions are tested.
+- Reservation release is explicit.
+
+### 22. Codex Implementation Contract
+
+Do not convert market orders to limit orders unless an explicit market-to-limit type is later specified. Do not scan unordered indexes. Do not use floating slippage percentages in the hot path; convert protection bands to fixed-point prices before matching.
+
+### 23. Review Checklist
+
+- [ ] Market buy traverses asks ascending.
+- [ ] Market sell traverses bids descending.
+- [ ] No liquidity rejection is deterministic.
+- [ ] Quote budget caps fill quantity.
+- [ ] Remainder expires, never rests.
+
+## Chapter 5: IOC, FOK, Post-Only, Reduce-Only Algorithms
+
+### 1. Purpose
+
+Specify deterministic behavior for common order modifiers and constraints: immediate-or-cancel, fill-or-kill, post-only, and reduce-only.
+
+### 2. Scope
+
+Applies to limit-compatible order commands and futures reduce-only constraints. Market IOC-like behavior is covered in Chapter 4.
+
+### 3. Non-Goals
+
+- Stop orders.
+- Iceberg orders.
+- Pegged orders.
+- Liquidation engine implementation beyond reduce-only interaction rules.
+
+### 4. Algorithmic Requirements
+
+- IOC matches immediately and cancels unfilled remainder.
+- FOK pre-checks full fill feasibility before mutation.
+- Post-only must not take liquidity; policy is deterministic reject or reprice.
+- Reduce-only must not increase exposure.
+- All modifier interactions have explicit precedence.
+
+### 5. Inputs
+
+- Order command with time-in-force and flags.
+- Current book state.
+- Position snapshot for reduce-only.
+- Reservation records.
+- Instrument policy config.
+
+### 6. Outputs
+
+- Accepted, rejected, trade, expired/canceled remainder, repriced, reservation consume/release, and reduce-only rejection events.
+
+### 7. Data Structures Used
+
+`OrderBook`, `SideBook`, `ReservationIndex`, position cache, event buffer, price protection helpers, limit matching helpers.
+
+### 8. Preconditions
+
+- Modifier combination is valid for instrument type.
+- Reduce-only position snapshot is book-local deterministic input.
+- FOK scan bound is configured.
+- Post-only policy is fixed per instrument.
+
+### 9. Postconditions
+
+- IOC has no resting remainder.
+- FOK either fully fills or performs no book mutation.
+- Post-only rests or rejects/reprices without taking liquidity.
+- Reduce-only resulting exposure magnitude is not increased.
+
+### 10. Invariants
+
+- FOK feasibility scan does not mutate state.
+- IOC partial fills preserve price-time priority.
+- Post-only never emits trade events unless policy is violated, which must be impossible.
+- Reduce-only fill quantity is capped by open reducible position.
+
+### 11. Step-by-Step Algorithm
+
+1. Validate modifier combination using deterministic precedence.
+2. For reduce-only, compute allowed side and max reducible quantity from position state.
+3. For post-only, check crossing before matching.
+4. For FOK, scan deterministic liquidity and budget to prove full fill.
+5. For IOC, execute normal limit matching but cancel remainder instead of resting.
+6. Emit explicit hold release for any unfilled or disallowed quantity.
+7. Validate invariants.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn process_ioc(book: &mut OrderBook, cmd: LimitOrderCommand) -> ApplyResult {
+    let mut incoming = IncomingOrder::from_limit(cmd);
+    book.events.push_accept(incoming.order_id);
+    match incoming.side {
+        Side::Buy => match_buy_limit(book, &mut incoming)?,
+        Side::Sell => match_sell_limit(book, &mut incoming)?,
+    }
+    if incoming.remaining_qty > Qty::ZERO {
+        book.events.push_expired(incoming.order_id, incoming.remaining_qty, ExpireReason::IocRemainder);
+        book.reservations.release_unfilled(incoming.reservation_id, incoming.remaining_qty)?;
+    }
+    validate_book_invariants(book)?;
+    ApplyResult::accepted()
+}
+
+fn process_fok(book: &mut OrderBook, cmd: LimitOrderCommand) -> ApplyResult {
+    if !can_fully_fill(book, &cmd)? {
+        book.events.push_rejected(cmd.order_id, RejectReason::FokNotFillable);
+        book.reservations.release_all(cmd.reservation_id)?;
+        return ApplyResult::rejected();
+    }
+    let mut full = cmd;
+    full.time_in_force = TimeInForce::ImmediateOrCancel;
+    process_ioc(book, full)
+}
+
+fn can_fully_fill(book: &OrderBook, cmd: &LimitOrderCommand) -> Result<bool, BookError> {
+    let mut remaining = cmd.qty;
+    let mut quote_budget = book.reservations.available_quote(cmd.reservation_id);
+    for level in book.opposite_levels_until(cmd.side, cmd.price) {
+        for maker in level.fifo_iter() {
+            let fill_qty = remaining.min(maker.remaining_qty);
+            if cmd.side == Side::Buy {
+                let notional = checked_mul_price_qty(level.price, fill_qty)?;
+                if notional > quote_budget { return Ok(false); }
+                quote_budget = quote_budget.checked_sub(notional)?;
+            }
+            remaining = remaining.checked_sub(fill_qty)?;
+            if remaining == Qty::ZERO { return Ok(true); }
+        }
+    }
+    Ok(false)
+}
+
+fn process_post_only(book: &mut OrderBook, cmd: LimitOrderCommand) -> ApplyResult {
+    let crosses = match cmd.side {
+        Side::Buy => book.asks.best_price().is_some_and(|p| p <= cmd.price),
+        Side::Sell => book.bids.best_price().is_some_and(|p| p >= cmd.price),
+    };
+    if crosses {
+        return match book.config.post_only_policy {
+            PostOnlyPolicy::Reject => reject(book, cmd, RejectReason::PostOnlyWouldTake),
+            PostOnlyPolicy::Reprice => {
+                let repriced = reprice_to_non_crossing(book, cmd)?;
+                rest_post_only(book, repriced)
+            }
+        };
+    }
+    rest_post_only(book, cmd)
+}
+
+fn process_reduce_only(book: &mut OrderBook, cmd: LimitOrderCommand, pos: Position) -> ApplyResult {
+    if !reduce_only_allowed(cmd.side, cmd.qty, pos) {
+        return reject(book, cmd, RejectReason::ReduceOnlyWouldIncrease);
+    }
+    let max_qty = reducible_qty(cmd.side, pos);
+    let capped = cmd.with_qty(cmd.qty.min(max_qty));
+    if capped.qty == Qty::ZERO {
+        return reject(book, cmd, RejectReason::NoOpenPosition);
+    }
+    process_limit_order(book, capped)
+}
+
+fn reduce_only_allowed(side: Side, qty: Qty, pos: Position) -> bool {
+    match (side, pos.direction()) {
+        (Side::Sell, PositionDirection::Long) => pos.abs_qty() > Qty::ZERO && qty <= pos.abs_qty(),
+        (Side::Buy, PositionDirection::Short) => pos.abs_qty() > Qty::ZERO && qty <= pos.abs_qty(),
+        _ => false,
+    }
+}
+```
+
+### 13. Complexity Analysis
+
+- IOC: same as limit matching, `O(L + F)`.
+- FOK feasibility: `O(L + N_scan)` without mutation; execution repeats the scan, so worst case `2 * O(L + F)`.
+- Post-only check: `O(1)` best-price lookup plus rest insertion.
+- Reduce-only check: `O(1)` position read plus normal processing.
+
+### 14. Edge Cases
+
+- IOC with no crossing: accept then expire full quantity or reject by venue policy; HermesNet default is accept and expire with hold release.
+- FOK with enough base but insufficient quote budget: reject before mutation.
+- FOK scan hits configured max scan: reject with `FokScanLimitExceeded`.
+- Post-only buy at best ask: reject or reprice one tick below best ask based on policy.
+- Reduce-only order larger than position: cap or reject based on instrument policy; default is cap to reducible quantity with event annotation.
+- Reduce-only during liquidation: liquidation commands may have priority; reduce-only user orders cannot increase exposure and may be canceled if liquidation state locks the position.
+
+### 15. Failure Modes
+
+- Position cache missing for reduce-only futures: reject `PositionUnavailable`.
+- Reprice would violate tick or price band: reject.
+- FOK precheck and execution diverge: invariant failure because single writer should prevent intervening mutation.
+
+### 16. Determinism Considerations
+
+FOK feasibility uses the same traversal order as matching but does not mutate. Post-only reprice uses integer tick arithmetic. Reduce-only uses a sequence-consistent position snapshot supplied to the Book Core.
+
+### 17. Replay Considerations
+
+Modifier decisions are evented: FOK not fillable, IOC remainder expired, post-only repriced/rejected, reduce-only capped/rejected. Replay verifies that the same branch is taken at the same sequence.
+
+### 18. Performance Considerations
+
+FOK doubles traversal cost; apply a deterministic scan bound. IOC should reuse limit matching with a no-rest finalizer. Post-only is cheap because it reads only best opposite price.
+
+### 19. Test Cases
+
+- IOC partially fills and expires remainder with hold release.
+- IOC no liquidity expires full quantity.
+- FOK fully fillable executes all requested quantity.
+- FOK not fully fillable emits no trades and no book mutation.
+- Post-only marketable order rejects under reject policy.
+- Post-only marketable order reprices under reprice policy without crossing.
+- Reduce-only sell reduces long position.
+- Reduce-only sell with short position rejects.
+- Reduce-only order larger than position caps or rejects per policy.
+
+### 20. Property-Based Tests
+
+- FOK rejection never changes book state hash.
+- IOC never leaves a resting order.
+- Post-only never emits a trade event.
+- Reduce-only never increases absolute exposure.
+- Modifier replay produces identical branch events.
+
+### 21. Acceptance Criteria
+
+- State impact table is encoded in tests.
+- FOK uses pre-mutation feasibility scan.
+- Hold release semantics are explicit for every non-resting remainder.
+- Reduce-only behavior is futures-aware.
+
+### 22. Codex Implementation Contract
+
+Do not implement FOK by executing and rolling back. Do not allow post-only to take liquidity. Do not read live positions from an external database in the hot path. Use a deterministic position cache input.
+
+### 23. Review Checklist
+
+- [ ] IOC remainder expires and releases hold.
+- [ ] FOK rejection has zero fills.
+- [ ] Post-only crossing branch follows configured policy.
+- [ ] Reduce-only rejects no-position orders.
+- [ ] Liquidation interaction is explicitly evented.
+
+### State Impact Tables
+
+| Modifier | Resting allowed? | Partial fill allowed? | Immediate reject? | Hold release? | EngineEvent type |
+|---|---:|---:|---:|---:|---|
+| IOC | No | Yes | Only validation failure | Unfilled remainder | `OrderExpired(IocRemainder)` |
+| FOK | No unless fully executed immediately | No | Yes if full fill impossible | Full hold on reject | `OrderRejected(FokNotFillable)` |
+| Post-Only Reject | Yes only if non-marketable | No immediate trade | Yes if would take | Full hold on reject | `OrderRejected(PostOnlyWouldTake)` |
+| Post-Only Reprice | Yes at non-crossing price | No immediate trade | Yes if reprice invalid | Released if rejected | `OrderRepriced`, `OrderRested` |
+| Reduce-Only | Yes if still reducing | Yes up to reducible qty | Yes if no reducible position | Disallowed qty | `OrderRejected` or `OrderQtyCapped` |
+
+## Chapter 6: Cancel and Replace Algorithms
+
+### Purpose
+
+TODO: Expand deterministic cancel and replace semantics for live resting orders.
+
+### Planned subsections
+
+- Cancel by order id.
+- Cancel by client order id.
+- Replace price and quantity.
+- Queue priority preservation and loss rules.
+- Reservation release and adjustment.
+- Idempotent duplicate cancel handling.
+
+### Key algorithms
+
+- `process_cancel()`
+- `process_replace()`
+- `unlink_resting_order()`
+- `apply_replace_priority_rule()`
+
+### Required Rust interfaces
+
+- `CancelCommand`
+- `ReplaceCommand`
+- `CancelResult`
+- `ReplaceResult`
+- `PriorityPolicy`
+
+### Required diagrams
+
+- Cancel lookup path.
+- Replace priority decision tree.
+- Reservation adjustment sequence.
+
+### Required test vectors
+
+- Cancel live order, cancel unknown order, duplicate cancel, replace reducing quantity, replace increasing quantity, replace price crossing.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 6 into full implementation-grade specification with pseudocode, edge cases, replay rules, and property tests.
+
+## Chapter 7: Self-Trade Prevention Algorithms
+
+### Purpose
+
+TODO: Specify deterministic prevention of trades where maker and taker belong to the same protected owner group.
+
+### Planned subsections
+
+- Owner group resolution.
+- Cancel taker policy.
+- Cancel maker policy.
+- Decrement-and-cancel policy.
+- Event ordering.
+- Fee and clearing suppression.
+
+### Key algorithms
+
+- `detect_self_trade()`
+- `apply_stp_policy()`
+- `cancel_maker_for_stp()`
+- `expire_taker_for_stp()`
+
+### Required Rust interfaces
+
+- `SelfTradePolicy`
+- `OwnerGroupId`
+- `StpDecision`
+- `StpEvent`
+
+### Required diagrams
+
+- STP decision tree.
+- Maker/taker cancellation sequence.
+
+### Required test vectors
+
+- Same account, same owner group, different owner group, partial decrement, multi-level STP continuation.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 7 into full implementation-grade specification with policy precedence and deterministic event semantics.
+
+## Chapter 8: Risk Reservation Algorithms
+
+### Purpose
+
+TODO: Specify fixed-point reservation creation, consumption, release, adjustment, and replay verification.
+
+### Planned subsections
+
+- Limit buy quote hold.
+- Sell base hold.
+- Market buy quote budget.
+- Futures margin reservation.
+- Reservation lifecycle.
+- Reservation-event reconciliation.
+
+### Key algorithms
+
+- `reserve_for_limit()`
+- `reserve_for_market()`
+- `consume_reservation()`
+- `release_reservation()`
+- `reconcile_reservations()`
+
+### Required Rust interfaces
+
+- `ReservationRequest`
+- `ReservationRecord`
+- `ReservationDelta`
+- `RiskCache`
+- `MarginModel`
+
+### Required diagrams
+
+- Reservation lifecycle.
+- Fill consumption and remainder release.
+- Replay reconciliation flow.
+
+### Required test vectors
+
+- Exact quote hold, over-reserved market buy, partial fill release, replace reservation increase, overflow rejection.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 8 into full implementation-grade specification with fixed-point formulas and conservation properties.
+
+## Chapter 9: Clearing and Fee Calculation Algorithms
+
+### Purpose
+
+TODO: Specify deterministic fee, rebate, balance delta, and position delta construction for fills.
+
+### Planned subsections
+
+- Maker/taker fee inputs.
+- Fee tier snapshot.
+- Spot clearing deltas.
+- Futures position deltas.
+- Rounding policy.
+- Fee event fields.
+
+### Key algorithms
+
+- `calculate_fee()`
+- `calculate_spot_delta()`
+- `calculate_futures_delta()`
+- `apply_rounding_policy()`
+
+### Required Rust interfaces
+
+- `FeeScheduleSnapshot`
+- `FeeDelta`
+- `ClearingDelta`
+- `PositionDelta`
+- `RoundingMode`
+
+### Required diagrams
+
+- Fill to clearing delta flow.
+- Fee rounding decision tree.
+
+### Required test vectors
+
+- Maker rebate, taker fee, zero-fee tier, minimum fee, futures long/short update, rounding boundary.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 9 into full implementation-grade specification with exact integer formulas and replay checks.
+
+## Chapter 10: EngineEvent Construction Algorithm
+
+### Purpose
+
+TODO: Define canonical construction, sealing, serialization, hash chaining, and publication of immutable `EngineEvent` records.
+
+### Planned subsections
+
+- Event type taxonomy.
+- Canonical field ordering.
+- Event batch construction.
+- Hash-chain update.
+- Publication and backpressure.
+- Schema compatibility.
+
+### Key algorithms
+
+- `build_engine_event()`
+- `seal_event()`
+- `append_event_hash_chain()`
+- `publish_event_batch()`
+
+### Required Rust interfaces
+
+- `EngineEvent`
+- `EngineEventBuilder`
+- `SealedEngineEvent`
+- `EventHashChain`
+- `EventSchemaVersion`
+
+### Required diagrams
+
+- Event builder lifecycle.
+- Hash-chain construction.
+- Event publication path.
+
+### Required test vectors
+
+- Canonical bytes, hash mismatch, schema version rejection, multi-event command order.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 10 into full implementation-grade specification with binary layout and hash vectors.
+
+## Chapter 11: Snapshot and Replay Algorithms
+
+### Purpose
+
+TODO: Specify canonical snapshots, replay restoration, divergence detection, and deterministic state rebuilding.
+
+### Planned subsections
+
+- Snapshot trigger policy.
+- Canonical state serialization.
+- Pool generation restoration.
+- Event replay.
+- Command replay.
+- Divergence quarantine.
+
+### Key algorithms
+
+- `write_snapshot()`
+- `restore_snapshot()`
+- `replay_events()`
+- `verify_state_hash()`
+- `locate_first_divergence()`
+
+### Required Rust interfaces
+
+- `SnapshotWriter`
+- `SnapshotReader`
+- `ReplayEngine`
+- `StateHash`
+- `DivergenceReport`
+
+### Required diagrams
+
+- Snapshot lifecycle.
+- Replay reconstruction sequence.
+- Divergence binary search.
+
+### Required test vectors
+
+- Clean replay, corrupted snapshot, corrupted event, schema migration, interrupted snapshot, replay speed benchmark.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 11 into full implementation-grade specification with canonical byte ordering and replay invariants.
+
+## Chapter 12: Determinism Proofs and Test Vectors
+
+### Purpose
+
+TODO: Provide formal-ish determinism arguments and executable vectors for matching, risk, events, snapshots, and replay.
+
+### Planned subsections
+
+- Determinism assumptions.
+- Price-time priority proof sketch.
+- Replay equivalence proof sketch.
+- Hash-chain tamper detection.
+- Cross-platform integer arithmetic tests.
+- Golden vectors.
+
+### Key algorithms
+
+- `run_golden_vector()`
+- `compare_replay_hashes()`
+- `assert_priority_equivalence()`
+- `mutate_event_and_expect_hash_failure()`
+
+### Required Rust interfaces
+
+- `GoldenVector`
+- `DeterminismHarness`
+- `ReplayComparison`
+- `PropertyTestConfig`
+
+### Required diagrams
+
+- Determinism dependency graph.
+- Golden vector execution flow.
+- Hash-chain verification flow.
+
+### Required test vectors
+
+- Limit one-level, limit multi-level, market protection stop, IOC partial, FOK reject, post-only reject, reduce-only reject, snapshot restore.
+
+### Codex expansion placeholder
+
+TODO: Expand Chapter 12 into full implementation-grade proof notes, golden vector schema, and automated test harness requirements.
+
+## Volume III Initial Expansion Summary
+
+1. Chapters added: Chapter 1 Algorithmic Design Principles, Chapter 2 Order Book Data Structures, Chapter 3 Limit Order Matching Algorithm, Chapter 4 Market Order Matching Algorithm, Chapter 5 IOC/FOK/Post-Only/Reduce-Only Algorithms, and structured outlines for Chapters 6 through 12.
+2. Algorithms specified: deterministic command application, fixed-point arithmetic, order insertion, limit matching, market matching, IOC expiration, FOK feasibility, post-only reject/reprice, and reduce-only gating.
+3. Data structures added: `OrderBook`, `SideBook`, `PriceLevelMap`, `PriceLevel`, `OrderNode`, `OrderIdIndex`, `ClientOrderIdIndex`, `ReservationIndex`, `EventBuffer`, and `SnapshotBuffer`.
+4. Rust pseudocode added: `apply_command`, `append_resting_order`, `process_limit_order`, `match_buy_limit`, `match_sell_limit`, `can_cross`, `execute_trade`, `rest_remaining`, `validate_book_invariants`, `process_market_order`, `match_market_buy`, `match_market_sell`, `enforce_price_protection`, `consume_liquidity`, `finalize_market_result`, `process_ioc`, `process_fok`, `can_fully_fill`, `process_post_only`, `process_reduce_only`, and `reduce_only_allowed`.
+5. Test categories added: deterministic replay, hash-chain verification, data-structure invariants, limit matching examples, market matching examples, modifier behavior, edge cases, failure modes, and property-based tests.
+6. Remaining TODO chapters: Chapter 6 Cancel and Replace Algorithms, Chapter 7 Self-Trade Prevention Algorithms, Chapter 8 Risk Reservation Algorithms, Chapter 9 Clearing and Fee Calculation Algorithms, Chapter 10 EngineEvent Construction Algorithm, Chapter 11 Snapshot and Replay Algorithms, and Chapter 12 Determinism Proofs and Test Vectors.
