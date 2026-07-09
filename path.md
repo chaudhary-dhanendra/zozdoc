@@ -9379,134 +9379,607 @@ Do not implement FOK by executing and rolling back. Do not allow post-only to ta
 
 ## Chapter 6: Cancel and Replace Algorithms
 
-### Purpose
+### 1. Purpose
 
-TODO: Expand deterministic cancel and replace semantics for live resting orders.
+Provide implementation-ready deterministic cancel and replace algorithms for a single-writer Book Core using book-local ordering, fixed-point arithmetic, immutable hash-chained `EngineEvent`s, and event append before externally visible success.
 
-### Planned subsections
+### 2. Scope
 
-- Cancel by order id.
-- Cancel by client order id.
-- Replace price and quantity.
-- Queue priority preservation and loss rules.
-- Reservation release and adjustment.
-- Idempotent duplicate cancel handling.
+Covers all required hot-path behavior for this chapter, including validation, state mutation, event semantics, risk hold consume/release, idempotent retries, deterministic replay, bounded loops, and bounded memory.
 
-### Key algorithms
+### 3. Non-Goals
 
-- `process_cancel()`
-- `process_replace()`
-- `unlink_resting_order()`
-- `apply_replace_priority_rule()`
+No global sequencing, database/Kafka/cloud dependency in the hot path, floating point decisions, locks inside matching, heap allocation in steady-state matching, or wall-clock dependency for matching decisions.
 
-### Required Rust interfaces
+### 4. Algorithmic Requirements
 
-- `CancelCommand`
-- `ReplaceCommand`
-- `CancelResult`
-- `ReplaceResult`
-- `PriorityPolicy`
+- Commands execute in book-local sequence order.
+- State changes are made only by the Book Core.
+- Risk changes use exact fixed-point integer deltas.
+- Every success appends immutable events first.
+- Duplicate `client_order_id` or request retries return the prior result without repeating mutation.
+- Loops are bounded by configured batch limits.
 
-### Required diagrams
+### 5. Inputs
 
-- Cancel lookup path.
-- Replace priority decision tree.
-- Reservation adjustment sequence.
+Book-local command snapshots, order identifiers, client order identifiers, user/account/instrument identifiers, product filters, immutable owner/risk snapshots, reservation records, and the previous event hash.
 
-### Required test vectors
+### 6. Outputs
 
-- Cancel live order, cancel unknown order, duplicate cancel, replace reducing quantity, replace increasing quantity, replace price crossing.
+Deterministic result enums, updated in-memory book/risk state, and `EngineEvent`s describing each accepted, rejected, consumed, released, canceled, replaced, prevented, or reconciled transition.
 
-### Codex expansion placeholder
+### 7. Data Structures Used
 
-TODO: Expand Chapter 6 into full implementation-grade specification with pseudocode, edge cases, replay rules, and property tests.
+Preallocated order arena, intrusive price-level queues, order-id index, `(user_id, client_order_id)` index, per-user live lists, reservation records, fixed-size idempotency cache, and append-only event buffer.
+
+### 8. Preconditions
+
+The command is authenticated, routed to the correct Book Core, statically validated, and has access to sequence-stable product/risk/ownership snapshots. Event buffer capacity is checked before mutation.
+
+### 9. Postconditions
+
+Book indexes, risk reservations, and idempotency records reflect exactly the appended events. Terminal orders are immutable. Replay from the event log reconstructs the same state hash.
+
+### 10. Invariants
+
+| Invariant | Requirement |
+|---|---|
+| Book-local order | Fill/cancel/replace/risk decisions follow one book sequence. |
+| Event-before-success | Client success is returned only after append. |
+| Hold conservation | `reserved = consumed + released + remaining`. |
+| Fixed-point math | All values are checked integers. |
+| Idempotency | Duplicate retries do not double reserve, consume, release, or cancel. |
+
+### 11. Step-by-Step Algorithm
+
+1. Check idempotency cache.
+2. Resolve by `order_id` or `(user_id, client_order_id)`.
+3. Reject not found or terminal orders deterministically.
+4. Sequence races with fills by Book Core order: earlier fill changes leaves before cancel/replace observes state.
+5. Cancel unlinks live order from price, user, and client live indexes; releases remaining hold; appends `HoldReleased` and `OrderCanceled`.
+6. Cancel-all for user, user+instrument, disconnect, logout, halt, or suspension iterates deterministic live lists up to batch limit.
+7. Replace validates tick, lot, ownership, remaining quantity, reduce-only, and reservation.
+8. Quantity reduction only amends in place, releases excess hold, and preserves priority.
+9. Price change or quantity increase reserves extra hold first, unlinks/reinserts at tail, and loses priority.
+10. Invalid replace appends `OrderReplaceRejected` with no book mutation.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn process_cancel(core: &mut BookCore, cmd: CancelCommand) -> CancelResult {
+    if let Some(r) = core.idem.cancel(cmd.request_id) { return r; }
+    let Some(r) = core.by_order_id.get(cmd.order_id) else { return emit_cancel_reject(core, cmd, CancelReject::OrderNotFound); };
+    cancel_live_ref(core, r, cmd.reason, cmd.request_id)
+}
+fn process_cancel_by_client_order_id(core: &mut BookCore, cmd: CancelCommand) -> CancelResult {
+    match core.by_client_id.lookup(cmd.user_id, cmd.client_order_id) {
+        ClientLookup::Live(r) => cancel_live_ref(core, r, cmd.reason, cmd.request_id),
+        ClientLookup::Terminal(x) => x.as_cancel_duplicate(),
+        ClientLookup::Missing => emit_cancel_reject(core, cmd, CancelReject::OrderNotFound),
+    }
+}
+fn cancel_all_for_user(core: &mut BookCore, user: UserId, reason: CancelReason) -> CancelAllResult {
+    let mut n = 0;
+    while n < core.cfg.cancel_batch {
+        let Some(r) = core.user_live.pop_front(user) else { break; };
+        if core.orders[r].is_live() { let _ = cancel_live_ref(core, r, reason, RequestId::derived(user, core.orders[r].order_id, reason)); n += 1; }
+    }
+    CancelAllResult { canceled: n, continuation: core.user_live.has_live(user) }
+}
+fn cancel_all_for_user_book(core: &mut BookCore, user: UserId, book: InstrumentId, reason: CancelReason) -> CancelAllResult {
+    let mut n = 0;
+    while n < core.cfg.cancel_batch {
+        let Some(r) = core.user_book_live.pop_front(user, book) else { break; };
+        if core.orders[r].is_live() { let _ = cancel_live_ref(core, r, reason, RequestId::derived(user, core.orders[r].order_id, reason)); n += 1; }
+    }
+    CancelAllResult { canceled: n, continuation: core.user_book_live.has_live(user, book) }
+}
+fn process_replace(core: &mut BookCore, cmd: ReplaceCommand) -> ReplaceResult {
+    if let Some(r) = core.idem.replace(cmd.request_id) { return r; }
+    let Some(r) = core.by_order_id.get(cmd.order_id) else { return emit_replace_reject(core, cmd, ReplaceReject::OrderNotFound); };
+    match validate_replace(core, r, &cmd) {
+        ReplaceDecision::Reduce { leaves } => amend_reducing_quantity(core, r, cmd, leaves),
+        ReplaceDecision::CancelNew { price, qty, extra } => replace_price_or_increase_qty(core, r, cmd, price, qty, extra),
+        ReplaceDecision::Reject(e) => emit_replace_reject(core, cmd, e),
+    }
+}
+fn validate_replace(core: &BookCore, r: OrderRef, cmd: &ReplaceCommand) -> ReplaceDecision {
+    let o = &core.orders[r];
+    if !o.is_live() { return ReplaceDecision::Reject(ReplaceReject::AlreadyTerminal); }
+    if !core.filters.valid_tick(cmd.new_price) { return ReplaceDecision::Reject(ReplaceReject::InvalidTick); }
+    if !core.filters.valid_lot(cmd.new_qty) || cmd.new_qty <= o.cum_filled { return ReplaceDecision::Reject(ReplaceReject::InvalidQty); }
+    let leaves = cmd.new_qty - o.cum_filled;
+    if cmd.reduce_only && leaves > o.leaves_qty { return ReplaceDecision::Reject(ReplaceReject::ReduceOnlyIncrease); }
+    if cmd.new_price == o.price && leaves <= o.leaves_qty { return ReplaceDecision::Reduce { leaves }; }
+    let extra = core.risk.extra_required(o, cmd.new_price, leaves);
+    if !core.risk.can_reserve(o.account_id, extra) { return ReplaceDecision::Reject(ReplaceReject::InsufficientReservation); }
+    ReplaceDecision::CancelNew { price: cmd.new_price, qty: cmd.new_qty, extra }
+}
+fn amend_reducing_quantity(core: &mut BookCore, r: OrderRef, cmd: ReplaceCommand, leaves: Qty) -> ReplaceResult {
+    let release = core.risk.release_for_reduction(r, core.orders[r].leaves_qty - leaves);
+    release_cancel_hold(core, r, release);
+    core.orders[r].leaves_qty = leaves;
+    emit_replace_event(core, r, cmd.request_id, PriorityEffect::Preserved)
+}
+fn replace_price_or_increase_qty(core: &mut BookCore, r: OrderRef, cmd: ReplaceCommand, p: Price, q: Qty, extra: Amount) -> ReplaceResult {
+    core.risk.reserve_extra(r, extra); core.events.append_hold_reserved(r, extra);
+    core.book.unlink(r); core.orders[r].price = p; core.orders[r].qty = q; core.orders[r].leaves_qty = q - core.orders[r].cum_filled;
+    core.orders[r].priority_seq = core.next_priority_seq(); core.book.insert_tail(p, r);
+    emit_replace_event(core, r, cmd.request_id, PriorityEffect::Lost)
+}
+fn release_cancel_hold(core: &mut BookCore, r: OrderRef, amount: Amount) { if amount > Amount::ZERO { core.risk.release(r, amount); core.events.append_hold_released(r, amount); } }
+fn emit_cancel_event(core: &mut BookCore, r: OrderRef, req: RequestId, reason: CancelReason) -> CancelResult { core.events.append_order_canceled(r, reason); core.idem.store_cancel(req); CancelResult::Canceled }
+fn emit_replace_event(core: &mut BookCore, r: OrderRef, req: RequestId, p: PriorityEffect) -> ReplaceResult { core.events.append_order_replaced(r, p); core.idem.store_replace(req); ReplaceResult::Accepted { priority: p } }
+```
+
+### Mermaid Diagrams
+
+```mermaid
+sequenceDiagram
+Client->>Book Core: Cancel(order_id)
+Book Core->>Book Core: Resolve and unlink
+Book Core->>Risk Cache: Release leaves hold
+Book Core->>Event Log: HoldReleased + OrderCanceled
+Book Core-->>Client: Canceled
+```
+```mermaid
+sequenceDiagram
+Fill->>Book Core: sequence n
+Book Core->>Event Log: Trade + HoldConsumed
+Cancel->>Book Core: sequence n+1
+Book Core->>Event Log: AlreadyTerminal or cancel remaining leaves
+```
+```mermaid
+sequenceDiagram
+Client->>Book Core: Replace
+Book Core->>Book Core: Validate priority rule
+Book Core->>Risk Cache: reserve extra or release excess
+Book Core->>Event Log: risk deltas + OrderReplaced
+```
+```mermaid
+flowchart TD
+A[Cancel-all trigger]-->B[Deterministic live list]-->C{Batch limit?}
+C--yes-->D[Continuation]
+C--no-->E{Eligible?}--yes-->F[Unlink/release/append]
+E--no-->B
+F-->B
+```
+
+### 13. Complexity Analysis
+
+Single cancel, in-place amend, and cancel-new replace are `O(1)`. Cancel-all is `O(k)` for bounded batch size `k`.
+
+### 14. Edge Cases
+
+Cancel resting, partially filled, already filled, unknown, duplicate, cancel/fill race, disconnect/logout/halt/suspension scoped cancels, lower-quantity priority preservation, price-change priority loss, quantity increase extra reservation, invalid tick rejection.
+
+### 15. Failure Modes
+
+Event capacity failure rejects before mutation. Risk corruption halts the book and recovers by replay. Insufficient extra reservation rejects replace without mutation.
+
+### 16. Determinism Considerations
+
+Cancel-all uses acceptance-sequence ordered intrusive lists. Fill/cancel/replace races are resolved only by book-local sequence.
+
+### 17. Replay Considerations
+
+Replay removes canceled orders, applies replace priority effects, and verifies hold releases against reconstructed reservations.
+
+### 18. Performance Considerations
+
+All common operations mutate preallocated indexes and intrusive nodes without locks or steady-state allocation.
+
+### 19. Test Cases
+
+1. Cancel resting order.
+2. Cancel partially filled order.
+3. Cancel already filled order rejects/idempotently returns final state.
+4. Duplicate cancel returns same result.
+5. Cancel/fill race resolves by book sequence.
+6. Replace lower quantity preserves priority.
+7. Replace price loses priority.
+8. Replace quantity increase requires extra reservation.
+9. Replace rejected due to tick size.
+10. Cancel-on-halt cancels only eligible orders.
+
+### 20. Property-Based Tests
+
+Cancel is idempotent; released plus consumed plus remaining equals reserved; pure reductions preserve priority; price changes lose priority; replay hash matches live hash.
+
+### 21. Acceptance Criteria
+
+All cancel triggers, rejection reasons, hold release paths, replace priority rules, and idempotent retry paths are evented and tested.
+
+### 22. Codex Implementation Contract
+
+Implement book-local logic only; do not add global sequencing, hot-path external dependencies, floating point math, locks, or steady-state allocation.
+
+### 23. Review Checklist
+
+- [ ] Terminal orders do not release twice.
+- [ ] Client-order-id lookup handles live and terminal records.
+- [ ] Triggered cancels are scoped and bounded.
+- [ ] Replace increase reserves before mutation.
+- [ ] Replace reduction preserves priority.
 
 ## Chapter 7: Self-Trade Prevention Algorithms
 
-### Purpose
+### 1. Purpose
 
-TODO: Specify deterministic prevention of trades where maker and taker belong to the same protected owner group.
+Provide implementation-ready deterministic self-trade prevention algorithms for a single-writer Book Core using book-local ordering, fixed-point arithmetic, immutable hash-chained `EngineEvent`s, and event append before externally visible success.
 
-### Planned subsections
+### 2. Scope
 
-- Owner group resolution.
-- Cancel taker policy.
-- Cancel maker policy.
-- Decrement-and-cancel policy.
-- Event ordering.
-- Fee and clearing suppression.
+Covers all required hot-path behavior for this chapter, including validation, state mutation, event semantics, risk hold consume/release, idempotent retries, deterministic replay, bounded loops, and bounded memory.
 
-### Key algorithms
+### 3. Non-Goals
 
-- `detect_self_trade()`
-- `apply_stp_policy()`
-- `cancel_maker_for_stp()`
-- `expire_taker_for_stp()`
+No global sequencing, database/Kafka/cloud dependency in the hot path, floating point decisions, locks inside matching, heap allocation in steady-state matching, or wall-clock dependency for matching decisions.
 
-### Required Rust interfaces
+### 4. Algorithmic Requirements
 
-- `SelfTradePolicy`
-- `OwnerGroupId`
-- `StpDecision`
-- `StpEvent`
+- Commands execute in book-local sequence order.
+- State changes are made only by the Book Core.
+- Risk changes use exact fixed-point integer deltas.
+- Every success appends immutable events first.
+- Duplicate `client_order_id` or request retries return the prior result without repeating mutation.
+- Loops are bounded by configured batch limits.
 
-### Required diagrams
+### 5. Inputs
 
-- STP decision tree.
-- Maker/taker cancellation sequence.
+Book-local command snapshots, order identifiers, client order identifiers, user/account/instrument identifiers, product filters, immutable owner/risk snapshots, reservation records, and the previous event hash.
 
-### Required test vectors
+### 6. Outputs
 
-- Same account, same owner group, different owner group, partial decrement, multi-level STP continuation.
+Deterministic result enums, updated in-memory book/risk state, and `EngineEvent`s describing each accepted, rejected, consumed, released, canceled, replaced, prevented, or reconciled transition.
 
-### Codex expansion placeholder
+### 7. Data Structures Used
 
-TODO: Expand Chapter 7 into full implementation-grade specification with policy precedence and deterministic event semantics.
+Preallocated order arena, intrusive price-level queues, order-id index, `(user_id, client_order_id)` index, per-user live lists, reservation records, fixed-size idempotency cache, and append-only event buffer.
+
+### 8. Preconditions
+
+The command is authenticated, routed to the correct Book Core, statically validated, and has access to sequence-stable product/risk/ownership snapshots. Event buffer capacity is checked before mutation.
+
+### 9. Postconditions
+
+Book indexes, risk reservations, and idempotency records reflect exactly the appended events. Terminal orders are immutable. Replay from the event log reconstructs the same state hash.
+
+### 10. Invariants
+
+| Invariant | Requirement |
+|---|---|
+| Book-local order | Fill/cancel/replace/risk decisions follow one book sequence. |
+| Event-before-success | Client success is returned only after append. |
+| Hold conservation | `reserved = consumed + released + remaining`. |
+| Fixed-point math | All values are checked integers. |
+| Idempotency | Duplicate retries do not double reserve, consume, release, or cancel. |
+
+### 11. Step-by-Step Algorithm
+
+1. Compare taker and maker account, sub-account, beneficial owner, and market-maker group snapshots before trade construction.
+2. If distinct, continue normal matching.
+3. Resolve mode by precedence: liquidation override if configured, exchange-enforced mode, then client-configurable mode.
+4. Post-only rejection/reprice happens before STP because no taking is allowed.
+5. STP happens before reduce-only consumption, FOK/IOC accounting, trade event creation, fees, and clearing.
+6. Apply Reject Taker, Cancel Maker, Cancel Both, Decrement and Cancel, or Allow and Flag.
+7. Emit STP, order, risk release, and surveillance events as applicable.
+
+Mode semantics: Reject Taker rejects incoming and releases taker hold; Cancel Maker removes resting order and releases maker hold; Cancel Both cancels both and releases both holds; Decrement and Cancel reduces both by `min(leaves)` with no trade/clearing and releases prevented holds; Allow and Flag executes normally, emits surveillance marker, and clears normally.
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn detect_self_trade(t: &OrderView, m: &OrderView) -> bool {
+    t.account_id == m.account_id || t.beneficial_owner_id == m.beneficial_owner_id ||
+    (t.market_maker_group_id.is_some() && t.market_maker_group_id == m.market_maker_group_id)
+}
+fn resolve_stp(core: &mut BookCore, taker: OrderRef, maker: OrderRef) -> StpDecision {
+    if !detect_self_trade(core.view(taker), core.view(maker)) { return StpDecision::Allow; }
+    match core.stp.mode(core.view(taker), core.view(maker)) {
+        StpMode::RejectTaker => apply_reject_taker(core, taker, maker),
+        StpMode::CancelMaker => apply_cancel_maker(core, taker, maker),
+        StpMode::CancelBoth => apply_cancel_both(core, taker, maker),
+        StpMode::DecrementAndCancel => apply_decrement_and_cancel(core, taker, maker),
+        StpMode::AllowAndFlag => { update_surveillance_marker(core, taker, maker); StpDecision::AllowFlagged }
+    }
+}
+fn apply_reject_taker(core: &mut BookCore, t: OrderRef, m: OrderRef) -> StpDecision { emit_stp_event(core,t,m,StpMode::RejectTaker); let a=core.risk.release_all(t); core.events.append_hold_released(t,a); core.events.append_order_rejected(t,RejectReason::SelfTrade); StpDecision::StopTaker }
+fn apply_cancel_maker(core: &mut BookCore, t: OrderRef, m: OrderRef) -> StpDecision { emit_stp_event(core,t,m,StpMode::CancelMaker); core.book.unlink(m); let a=core.risk.release_all(m); core.events.append_hold_released(m,a); core.events.append_order_canceled(m,CancelReason::SelfTradePrevention); StpDecision::ContinueTaker }
+fn apply_cancel_both(core: &mut BookCore, t: OrderRef, m: OrderRef) -> StpDecision { let _=apply_cancel_maker(core,t,m); emit_stp_event(core,t,m,StpMode::CancelBoth); let a=core.risk.release_all(t); core.events.append_hold_released(t,a); core.events.append_order_canceled(t,CancelReason::SelfTradePrevention); StpDecision::StopTaker }
+fn apply_decrement_and_cancel(core: &mut BookCore, t: OrderRef, m: OrderRef) -> StpDecision { let q=core.orders[t].leaves_qty.min(core.orders[m].leaves_qty); emit_stp_event(core,t,m,StpMode::DecrementAndCancel); core.orders[t].leaves_qty-=q; core.orders[m].leaves_qty-=q; core.events.append_hold_released(t,core.risk.release_for_prevented_qty(t,q)); core.events.append_hold_released(m,core.risk.release_for_prevented_qty(m,q)); core.events.append_order_decremented(t,q); core.events.append_order_decremented(m,q); if core.orders[m].leaves_qty==Qty::ZERO{core.book.unlink(m);} if core.orders[t].leaves_qty==Qty::ZERO{StpDecision::StopTaker}else{StpDecision::ContinueTaker} }
+fn emit_stp_event(core: &mut BookCore, t: OrderRef, m: OrderRef, mode: StpMode) { core.events.append_self_trade_prevented(t,m,mode); }
+fn update_surveillance_marker(core: &mut BookCore, t: OrderRef, m: OrderRef) { core.surveillance.mark(t,m); core.events.append_surveillance_flag(t,m,SurveillanceReason::SelfTradeAllowed); }
+```
+
+### Mermaid Diagrams
+
+```mermaid
+sequenceDiagram
+Matcher->>Book Core: Potential cross
+Book Core->>Book Core: Compare owner keys
+Book Core->>Event Log: SelfTradePrevented or SurveillanceFlagged
+```
+```mermaid
+flowchart TD
+A[Self-match]-->B[Reject taker]-->C[Release taker hold]-->D[Append reject]
+```
+```mermaid
+flowchart TD
+A[Self-match]-->B[Cancel maker]-->C[Unlink maker]-->D[Release maker hold]-->E[Continue taker]
+```
+```mermaid
+flowchart TD
+A[Self-match]-->B[min leaves]-->C[Decrement both]-->D[Release prevented holds]-->E{Taker leaves?}
+```
+
+### 13. Complexity Analysis
+
+Detection and mode resolution are `O(1)` per maker candidate. Maker unlink and hold release are `O(1)`.
+
+### 14. Edge Cases
+
+Same user, same beneficial owner across sub-accounts, market-maker group, post-only plus STP, reduce-only, FOK/IOC feasibility, liquidation override, and surveillance flag generation.
+
+### 15. Failure Modes
+
+Missing owner snapshot rejects at order entry. Reservation mismatch during STP release halts and recovers by replay.
+
+### 16. Determinism Considerations
+
+Tie-breaking is price-time maker order plus fixed STP precedence. No external ownership lookup or wall-clock input is allowed.
+
+### 17. Replay Considerations
+
+Replay verifies prevented quantities, absence of clearing for prevented trades, risk releases, and surveillance markers.
+
+### 18. Performance Considerations
+
+Owner keys and STP mode are inline in order slots; surveillance writes use bounded marker buffers.
+
+### 19. Test Cases
+
+1. Same user buy crosses own sell.
+2. Same beneficial owner across sub-accounts.
+3. Market maker group self-match.
+4. Reject taker prevents execution.
+5. Cancel maker removes resting order.
+6. Cancel both removes incoming and resting.
+7. Decrement and cancel partially reduces both sides.
+8. Post-only plus STP conflict.
+9. Liquidation order STP override.
+10. Surveillance flag generated.
+
+### 20. Property-Based Tests
+
+Prevented self-trades emit no trade; distinct owners never trigger STP; released holds equal prevented exposure; replay decisions match live decisions.
+
+### 21. Acceptance Criteria
+
+Each mode defines use case, algorithm, event semantics, clearing semantics, risk impact, surveillance impact, and client response. Precedence and modifier interactions are tested.
+
+### 22. Codex Implementation Contract
+
+Do not query account databases in matching; do not create clearing for prevented quantities; do not suppress STP events.
+
+### 23. Review Checklist
+
+- [ ] Beneficial owner and sub-account handling are explicit.
+- [ ] Exchange mode overrides client mode.
+- [ ] Liquidation override is evented.
+- [ ] Risk releases are exact.
+- [ ] Surveillance marker is replayable.
 
 ## Chapter 8: Risk Reservation Algorithms
 
-### Purpose
+### 1. Purpose
 
-TODO: Specify fixed-point reservation creation, consumption, release, adjustment, and replay verification.
+Provide implementation-ready deterministic risk reservation algorithms for a single-writer Book Core using book-local ordering, fixed-point arithmetic, immutable hash-chained `EngineEvent`s, and event append before externally visible success.
 
-### Planned subsections
+### 2. Scope
 
-- Limit buy quote hold.
-- Sell base hold.
-- Market buy quote budget.
-- Futures margin reservation.
-- Reservation lifecycle.
-- Reservation-event reconciliation.
+Covers all required hot-path behavior for this chapter, including validation, state mutation, event semantics, risk hold consume/release, idempotent retries, deterministic replay, bounded loops, and bounded memory.
 
-### Key algorithms
+### 3. Non-Goals
 
-- `reserve_for_limit()`
-- `reserve_for_market()`
-- `consume_reservation()`
-- `release_reservation()`
-- `reconcile_reservations()`
+No global sequencing, database/Kafka/cloud dependency in the hot path, floating point decisions, locks inside matching, heap allocation in steady-state matching, or wall-clock dependency for matching decisions.
 
-### Required Rust interfaces
+### 4. Algorithmic Requirements
 
-- `ReservationRequest`
-- `ReservationRecord`
-- `ReservationDelta`
-- `RiskCache`
-- `MarginModel`
+- Commands execute in book-local sequence order.
+- State changes are made only by the Book Core.
+- Risk changes use exact fixed-point integer deltas.
+- Every success appends immutable events first.
+- Duplicate `client_order_id` or request retries return the prior result without repeating mutation.
+- Loops are bounded by configured batch limits.
 
-### Required diagrams
+### 5. Inputs
 
-- Reservation lifecycle.
-- Fill consumption and remainder release.
-- Replay reconciliation flow.
+Book-local command snapshots, order identifiers, client order identifiers, user/account/instrument identifiers, product filters, immutable owner/risk snapshots, reservation records, and the previous event hash.
 
-### Required test vectors
+### 6. Outputs
 
-- Exact quote hold, over-reserved market buy, partial fill release, replace reservation increase, overflow rejection.
+Deterministic result enums, updated in-memory book/risk state, and `EngineEvent`s describing each accepted, rejected, consumed, released, canceled, replaced, prevented, or reconciled transition.
 
-### Codex expansion placeholder
+### 7. Data Structures Used
 
-TODO: Expand Chapter 8 into full implementation-grade specification with fixed-point formulas and conservation properties.
+Preallocated order arena, intrusive price-level queues, order-id index, `(user_id, client_order_id)` index, per-user live lists, reservation records, fixed-size idempotency cache, and append-only event buffer.
+
+### 8. Preconditions
+
+The command is authenticated, routed to the correct Book Core, statically validated, and has access to sequence-stable product/risk/ownership snapshots. Event buffer capacity is checked before mutation.
+
+### 9. Postconditions
+
+Book indexes, risk reservations, and idempotency records reflect exactly the appended events. Terminal orders are immutable. Replay from the event log reconstructs the same state hash.
+
+### 10. Invariants
+
+| Invariant | Requirement |
+|---|---|
+| Book-local order | Fill/cancel/replace/risk decisions follow one book sequence. |
+| Event-before-success | Client success is returned only after append. |
+| Hold conservation | `reserved = consumed + released + remaining`. |
+| Fixed-point math | All values are checked integers. |
+| Idempotency | Duplicate retries do not double reserve, consume, release, or cancel. |
+
+### 11. Step-by-Step Algorithm
+
+1. Resolve duplicate `client_order_id`; return existing reservation without reserving again.
+2. Compute required hold using checked fixed-point arithmetic.
+3. Spot buy limit reserves quote notional plus fee; spot sell limit reserves base asset; market buy reserves quote budget plus fee cap; market sell reserves base quantity.
+4. Futures reserve initial margin plus fee cap; maintenance margin is tracked; reduce-only reserves zero or fee-only when exposure cannot increase.
+5. Debit available and credit reserved; append `ReservationReserved` before order acceptance.
+6. Fill consumes proportional reservation and appends `ReservationConsumed` before externally visible trade success.
+7. Cancel/reject/expiry/STP release remaining hold exactly once.
+8. Funding and unrealized PnL update risk cache by evented settled adjustments; liquidation locks/releases margin through explicit events.
+9. Reconcile hot risk cache with cold ledger projection outside matching and emit mismatch events.
+
+### Reservation State Machine and Invariant Table
+
+| State | Meaning |
+|---|---|
+| Requested | Hold calculation started, no balance mutation yet. |
+| Reserved | Available debited and reserved credited. |
+| PartiallyConsumed | Some hold consumed by fills. |
+| Consumed | All hold consumed by fills/settlement. |
+| Released | Remaining hold returned. |
+| Expired | Time-in-force or reservation TTL released hold. |
+| Reconciled | Hot cache matched cold projection. |
+| Failed | Rejected before mutation or released after partial mutation. |
+
+| Invariant | Formula |
+|---|---|
+| No negative available | `available >= 0`. |
+| Total conservation | `total = available + reserved + locked + settled_adjustments`. |
+| Reservation conservation | `requested = consumed + released + remaining`. |
+| Fill bound | `trade_consumption <= remaining_reserved`. |
+
+### 12. Rust-Style Pseudocode
+
+```rust
+fn reserve_for_limit_order(risk: &mut RiskCache, o: &OrderCommand) -> RiskResult<ReservationId> { if let Some(id)=risk.idem.lookup(o.account_id,o.client_order_id){return Ok(id);} match (o.product,o.side){(Product::Spot,Side::Buy)=>reserve_spot_buy(risk,o),(Product::Spot,Side::Sell)=>reserve_spot_sell(risk,o),(Product::Futures,_)=>reserve_futures_margin(risk,o)} }
+fn reserve_for_market_order(risk: &mut RiskCache, o: &OrderCommand) -> RiskResult<ReservationId> { if o.side==Side::Buy { let fee=risk.fees.max_fee(o.quote_budget); risk.reserve_asset(o.account_id,o.quote_asset,o.quote_budget.checked_add(fee)?,HoldReason::MarketBuy) } else { risk.reserve_asset(o.account_id,o.base_asset,o.qty,HoldReason::MarketSell) } }
+fn consume_reservation_for_trade(risk: &mut RiskCache, f: &Fill) -> RiskResult<()> { let need=risk.consumption_for_fill(f)?; let r=risk.reservation_mut(f.order_id)?; if need>r.remaining(){return Err(RiskReject::InsufficientReservation);} r.consumed+=need; risk.events.append_reservation_consumed(f.order_id,need); Ok(()) }
+fn release_reservation_for_cancel(risk: &mut RiskCache, order_id: OrderId) -> RiskResult<Amount> { let r=risk.reservation_mut(order_id)?; let a=r.remaining(); if a>Amount::ZERO { r.released+=a; risk.credit_available(r.account_id,r.asset,a)?; risk.events.append_reservation_released(order_id,a,ReleaseReason::Cancel); } Ok(a) }
+fn release_reservation_for_reject(risk: &mut RiskCache, order_id: OrderId) -> RiskResult<Amount> { let a=risk.reservation(order_id).map(|r|r.remaining()).unwrap_or(Amount::ZERO); if a>Amount::ZERO{risk.release(order_id,a,ReleaseReason::Reject)?;} Ok(a) }
+fn reconcile_reservations(risk: &mut RiskCache, cold: &LedgerProjection) -> ReconcileResult { let mut mismatches=0; for a in risk.accounts_bounded_iter(){ if risk.total(a)!=cold.total(a){ risk.events.append_reconciliation_mismatch(a,risk.total(a),cold.total(a)); mismatches+=1; } } ReconcileResult{mismatches} }
+fn validate_reservation_invariants(risk: &RiskCache, account: AccountId) -> RiskResult<()> { for asset in risk.assets_bounded(account){ let b=risk.balance(account,asset); if b.available<Amount::ZERO{return Err(RiskReject::NegativeAvailable);} if b.total!=b.available+b.reserved+b.locked+b.settled_adjustments{return Err(RiskReject::ConservationViolation);} } Ok(()) }
+fn reserve_spot_buy(risk: &mut RiskCache, o: &OrderCommand) -> RiskResult<ReservationId> { let n=o.price.checked_mul_qty(o.qty)?; let fee=risk.fees.max_fee(n); risk.reserve_asset(o.account_id,o.quote_asset,n.checked_add(fee)?,HoldReason::SpotBuyLimit) }
+fn reserve_spot_sell(risk: &mut RiskCache, o: &OrderCommand) -> RiskResult<ReservationId> { risk.reserve_asset(o.account_id,o.base_asset,o.qty,HoldReason::SpotSellLimit) }
+fn reserve_futures_margin(risk: &mut RiskCache, o: &OrderCommand) -> RiskResult<ReservationId> { if o.reduce_only && !risk.position_would_increase_abs(o){return risk.reserve_zero(o,HoldReason::ReduceOnly);} let n=o.price.checked_mul_qty(o.qty)?; let m=risk.margin.initial_margin(n,o.leverage)?; let fee=risk.fees.max_fee(n); risk.reserve_asset(o.account_id,o.margin_asset,m.checked_add(fee)?,HoldReason::FuturesInitialMargin) }
+fn apply_funding_to_risk_cache(risk: &mut RiskCache, f: FundingDelta) -> RiskResult<()> { risk.apply_settled_adjustment(f.account_id,f.asset,f.amount)?; risk.events.append_funding_applied(f); validate_reservation_invariants(risk,f.account_id) }
+fn apply_liquidation_risk_update(risk: &mut RiskCache, l: LiquidationDelta) -> RiskResult<()> { risk.lock_or_release_margin(l.account_id,l.margin_delta)?; risk.events.append_liquidation_risk_update(l); validate_reservation_invariants(risk,l.account_id) }
+```
+
+### Mermaid Diagrams
+
+```mermaid
+stateDiagram-v2
+[*]-->Requested
+Requested-->Reserved
+Requested-->Failed
+Reserved-->PartiallyConsumed
+Reserved-->Released
+PartiallyConsumed-->Consumed
+PartiallyConsumed-->Released
+Released-->Reconciled
+Consumed-->Reconciled
+```
+```mermaid
+sequenceDiagram
+Command->>Risk Cache: quote notional + fee
+Risk Cache->>Event Log: ReservationReserved
+Event Log-->>Book Core: hash
+Book Core->>Book Core: accept order
+```
+```mermaid
+sequenceDiagram
+Book Core->>Risk Cache: Consume partial fill
+Risk Cache->>Event Log: ReservationConsumed
+Book Core->>Risk Cache: Release remainder
+Risk Cache->>Event Log: ReservationReleased
+```
+```mermaid
+sequenceDiagram
+Book Core->>Risk Cache: Cancel
+Risk Cache->>Event Log: ReservationReleased(remaining)
+```
+```mermaid
+sequenceDiagram
+Event Log->>Risk Cache: Replay events
+Risk Cache->>Risk Cache: Validate invariants
+Risk Cache->>Cold Ledger: Compare projection
+Risk Cache->>Event Log: Reconciliation event
+```
+
+### 13. Complexity Analysis
+
+Reserve, consume, release, funding, and liquidation cache updates are `O(1)`. Reconciliation is bounded shard iteration outside matching.
+
+### 14. Edge Cases
+
+Spot buy quote+fee, spot sell base, partial fills, exact-once cancel release, duplicate retry, reject release/avoidance, market-buy budget, futures margin, reduce-only no risk increase, corruption detection, expiry, local/market-maker credit buckets, retail sharded risk, and cold ledger mismatch.
+
+### 15. Failure Modes
+
+Insufficient reservation, insufficient available, arithmetic overflow, missing reservation on fill, expired reservation, corrupted record, and cold-ledger mismatch produce deterministic reject, halt-and-replay, or reconciliation events.
+
+### 16. Determinism Considerations
+
+All formulas are integer fixed-point with stable rounding. Risk cache, credit bucket, margin, funding, and liquidation inputs are sequence-stable snapshots.
+
+### 17. Replay Considerations
+
+Replay reconstructs requested/reserved/consumed/released/expired/reconciled/failed states from events and validates invariants before accepting new commands.
+
+### 18. Performance Considerations
+
+Hot path uses fixed-key updates and preallocated records. Cold ledger projection reconciliation is outside matching.
+
+### 19. Test Cases
+
+1. Spot buy limit reserves quote + fee.
+2. Spot sell limit reserves base asset.
+3. Partial fill consumes proportional reservation.
+4. Cancel releases remaining reservation exactly once.
+5. Duplicate order retry does not double reserve.
+6. Reject releases or avoids reservation.
+7. Market buy respects quote budget.
+8. Futures order reserves initial margin.
+9. Reduce-only order does not increase risk.
+10. Replay reconstructs identical reservation state.
+11. Corrupted reservation detected by invariant check.
+12. Cold ledger reconciliation detects mismatch.
+
+### 20. Property-Based Tests
+
+Available never negative; total conservation always holds; consumed never exceeds reserved; duplicate client order id never double reserves; replay risk hash equals live risk hash.
+
+### 21. Acceptance Criteria
+
+All lifecycle states, spot formulas, futures formulas, consume/release semantics, credit bucket behavior, reconciliation, corruption detection, and replay recovery are specified and tested.
+
+### 22. Codex Implementation Contract
+
+Do not add hot-path cold ledger reads, database calls, floating point math, global locks, unbounded scans, or non-evented risk mutations.
+
+### 23. Review Checklist
+
+- [ ] No-negative-available is checked.
+- [ ] Balance conservation is checked.
+- [ ] Duplicate client order id cannot double reserve.
+- [ ] Cancel/reject release is exactly once.
+- [ ] Replay reconstructs identical reservation state.
+
+## Volume III Phase 2 Expansion Summary
+
+1. Chapters expanded: Chapter 6 Cancel and Replace Algorithms; Chapter 7 Self-Trade Prevention Algorithms; Chapter 8 Risk Reservation Algorithms.
+2. Algorithms added: cancel by order id, cancel by client order id, cancel-all scopes, cancel triggers, replace validation/amend/cancel-new, STP detection and mode actions, reservation reserve/consume/release/reconcile, funding, and liquidation risk updates.
+3. Mermaid diagrams added: cancel order sequence, cancel/fill race sequence, replace order sequence, cancel-all flow, STP detection, reject-taker flow, cancel-maker flow, decrement-and-cancel flow, reservation lifecycle, limit buy reservation, partial fill consume/release, cancel release, and replay reconstruction.
+4. Rust pseudocode added: required cancel, replace, STP, and risk reservation functions.
+5. Risk invariants added: no-negative-available, total balance conservation, reservation conservation, fill bound, idempotent reservation retry, and futures leverage constraints.
+6. Remaining TODO chapters: Chapter 9 Clearing and Fee Calculation Algorithms, Chapter 10 EngineEvent Construction Algorithm, Chapter 11 Snapshot and Replay Algorithms, and Chapter 12 Determinism Proofs and Test Vectors.
 
 ## Chapter 9: Clearing and Fee Calculation Algorithms
 
