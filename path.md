@@ -9972,15 +9972,6 @@ Do not add hot-path cold ledger reads, database calls, floating point math, glob
 - [ ] Cancel/reject release is exactly once.
 - [ ] Replay reconstructs identical reservation state.
 
-## Volume III Phase 2 Expansion Summary
-
-1. Chapters expanded: Chapter 6 Cancel and Replace Algorithms; Chapter 7 Self-Trade Prevention Algorithms; Chapter 8 Risk Reservation Algorithms.
-2. Algorithms added: cancel by order id, cancel by client order id, cancel-all scopes, cancel triggers, replace validation/amend/cancel-new, STP detection and mode actions, reservation reserve/consume/release/reconcile, funding, and liquidation risk updates.
-3. Mermaid diagrams added: cancel order sequence, cancel/fill race sequence, replace order sequence, cancel-all flow, STP detection, reject-taker flow, cancel-maker flow, decrement-and-cancel flow, reservation lifecycle, limit buy reservation, partial fill consume/release, cancel release, and replay reconstruction.
-4. Rust pseudocode added: required cancel, replace, STP, and risk reservation functions.
-5. Risk invariants added: no-negative-available, total balance conservation, reservation conservation, fill bound, idempotent reservation retry, and futures leverage constraints.
-6. Remaining TODO chapters: Chapter 9 Clearing and Fee Calculation Algorithms, Chapter 10 EngineEvent Construction Algorithm, Chapter 11 Snapshot and Replay Algorithms, and Chapter 12 Determinism Proofs and Test Vectors.
-
 ## Chapter 9: Clearing and Fee Calculation Algorithms
 
 ### Purpose
@@ -10975,11 +10966,20 @@ Any new algorithm must add invariants, golden vectors, replay vectors, and failu
 - Test vectors added: certification matrix covering hundreds of concrete scenarios across matching, modifiers, cancellation, STP, reservation, clearing, snapshots, replay, corruption, and migration.
 - Remaining gaps before Version 1.0: executable fixture files must be generated from the canonical encoder, benchmark thresholds must be calibrated on production hardware, and external audit sign-off must approve the final ledger account map.
 
-## Volume III Initial Expansion Summary
 
-1. Chapters added: Chapter 1 Algorithmic Design Principles, Chapter 2 Order Book Data Structures, Chapter 3 Limit Order Matching Algorithm, Chapter 4 Market Order Matching Algorithm, Chapter 5 IOC/FOK/Post-Only/Reduce-Only Algorithms, and structured outlines for Chapters 6 through 12.
-2. Algorithms specified: deterministic command application, fixed-point arithmetic, order insertion, limit matching, market matching, IOC expiration, FOK feasibility, post-only reject/reprice, and reduce-only gating.
-3. Data structures added: `OrderBook`, `SideBook`, `PriceLevelMap`, `PriceLevel`, `OrderNode`, `OrderIdIndex`, `ClientOrderIdIndex`, `ReservationIndex`, `EventBuffer`, and `SnapshotBuffer`.
-4. Rust pseudocode added: `apply_command`, `append_resting_order`, `process_limit_order`, `match_buy_limit`, `match_sell_limit`, `can_cross`, `execute_trade`, `rest_remaining`, `validate_book_invariants`, `process_market_order`, `match_market_buy`, `match_market_sell`, `enforce_price_protection`, `consume_liquidity`, `finalize_market_result`, `process_ioc`, `process_fok`, `can_fully_fill`, `process_post_only`, `process_reduce_only`, and `reduce_only_allowed`.
-5. Test categories added: deterministic replay, hash-chain verification, data-structure invariants, limit matching examples, market matching examples, modifier behavior, edge cases, failure modes, and property-based tests.
-6. Remaining TODO chapters: Chapter 6 Cancel and Replace Algorithms, Chapter 7 Self-Trade Prevention Algorithms, Chapter 8 Risk Reservation Algorithms, Chapter 9 Clearing and Fee Calculation Algorithms, Chapter 10 EngineEvent Construction Algorithm, Chapter 11 Snapshot and Replay Algorithms, and Chapter 12 Determinism Proofs and Test Vectors.
+## Volumes I–III Freeze Note
+
+- Volumes I–III are now treated as the baseline specification for the HermesNet core trading engine.
+- Future edits to Volumes I–III should be limited to corrections, consistency updates, cross-references, and approved amendments.
+- New major functionality should be added in later volumes rather than appended into Volumes I–III.
+- Remaining major work belongs to Volume IV onward.
+
+## Remaining Volumes Roadmap
+
+- Volume IV – Wallet, Ledger & Financial Accounting
+- Volume V – Futures, Margin & Liquidation
+- Volume VI – Market Data & Connectivity
+- Volume VII – Operations, SRE & Infrastructure
+- Volume VIII – Security & Compliance
+- Volume IX – Quality Engineering
+- Volume X – Engineering Standards
