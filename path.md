@@ -10966,6 +10966,829 @@ Any new algorithm must add invariants, golden vectors, replay vectors, and failu
 - Test vectors added: certification matrix covering hundreds of concrete scenarios across matching, modifiers, cancellation, STP, reservation, clearing, snapshots, replay, corruption, and migration.
 - Remaining gaps before Version 1.0: executable fixture files must be generated from the canonical encoder, benchmark thresholds must be calibrated on production hardware, and external audit sign-off must approve the final ledger account map.
 
+# VOLUME IV: WALLET, LEDGER & FINANCIAL ACCOUNTING
+
+Volume IV specifies the HermesNet wallet, ledger, and financial-accounting layer. It preserves the core principles established in Volumes I–III: fixed-point integers only, deterministic accounting, immutable audit trails, event-sourced projections, no double spend, no negative balance unless explicitly permitted by later margin rules, every ledger movement balances, every financial mutation is auditable, and the trading hot path never depends on wallet database calls.
+
+## Chapter 1: Financial Accounting Principles
+
+### Purpose
+
+Define the accounting rules that govern every HermesNet financial mutation. The chapter establishes how balances, reservations, ledger entries, audit events, and projections behave so wallet state can be reconstructed, certified, and reconciled from immutable facts.
+
+### Scope
+
+Covers integer money representation, account classifications, balance conservation, event sourcing, immutable audit trails, deterministic ordering, idempotency, and the boundary between trading-engine reservation logic and wallet persistence. It applies to deposits, withdrawals, trades, fees, rebates, insurance movements, treasury transfers, and operational corrections.
+
+### Non-Goals
+
+- Define margin lending, liquidation, or credit extension rules.
+- Prescribe external banking, blockchain, or custodian APIs.
+- Replace jurisdiction-specific financial statements or tax reporting.
+- Permit floating-point arithmetic, wall-clock-dependent accounting decisions, or mutable ledger rewrites.
+
+### Domain Model
+
+- **Asset**: Canonical currency or token identifier with immutable precision metadata.
+- **Account**: Ledger account owned by a user, system module, treasury entity, fee collector, insurance fund, or suspense process.
+- **Wallet**: User-facing balance projection derived from ledger events.
+- **Ledger Entry**: Atomic debit or credit line in a balanced journal transaction.
+- **Journal Transaction**: Ordered group of ledger entries whose debits equal credits per asset.
+- **Financial Event**: Immutable command outcome that produced one or more journal transactions.
+- **Projection**: Deterministic read model built from the event log.
+- **Reservation**: Engine-visible hold created before matching so the trading hot path can avoid wallet database calls.
+- **Audit Trail**: Hash-chained record linking command, authorization, journal entries, and resulting projection hashes.
+
+### Data Structures
+
+All amounts are fixed-point minor units and every operation uses checked arithmetic.
+
+```rust
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct AssetId(u32);
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct AccountId(u128);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Amount(i128); // fixed-point minor units; never float
+
+enum AccountKind {
+    UserAvailable,
+    UserReserved,
+    ExternalClearing,
+    TreasuryHot,
+    TreasuryCold,
+    FeeRevenue,
+    RebateExpense,
+    InsuranceFund,
+    Suspense,
+}
+
+struct LedgerAccount {
+    id: AccountId,
+    asset: AssetId,
+    kind: AccountKind,
+    allow_negative: bool,
+    opened_at_seq: u64,
+    closed_at_seq: Option<u64>,
+}
+
+struct LedgerLine {
+    account: AccountId,
+    asset: AssetId,
+    debit: Amount,
+    credit: Amount,
+    memo_code: u16,
+}
+
+struct JournalTransaction {
+    journal_id: u128,
+    causation_event_id: u128,
+    sequence: u64,
+    lines: Vec<LedgerLine>,
+    canonical_hash: [u8; 32],
+}
+```
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> CommandReceived
+    CommandReceived --> Authorized
+    Authorized --> IdempotencyChecked
+    IdempotencyChecked --> JournalBuilt
+    JournalBuilt --> BalancedValidated
+    BalancedValidated --> Appended
+    Appended --> Projected
+    Projected --> Reconciled
+    IdempotencyChecked --> DuplicateRejected
+    JournalBuilt --> InvalidRejected
+    BalancedValidated --> InvalidRejected
+```
+
+### Algorithms
+
+1. Canonicalize the command, actor, asset, amount, account ids, and idempotency key.
+2. Verify authorization and account status.
+3. Reject duplicate idempotency keys unless the canonical payload hash matches the previous accepted command.
+4. Build journal lines deterministically.
+5. Validate that total debits equal total credits for each asset.
+6. Validate account-level balance constraints and non-negative rules.
+7. Append the journal and audit event atomically to the immutable log.
+8. Update event-sourced projections in sequence order.
+9. Emit projection hashes for reconciliation and certification.
+
+### Rust-style pseudocode
+
+```rust
+fn post_financial_event(cmd: FinancialCommand, state: &mut LedgerState) -> Result<EventId, Error> {
+    let payload_hash = hash32(&cmd.canonical_bytes());
+    state.authz.require(cmd.actor, cmd.required_permission())?;
+    state.idempotency.reserve_or_verify(cmd.idempotency_key, payload_hash)?;
+
+    let journal = build_journal(&cmd)?;
+    validate_balanced_by_asset(&journal)?;
+    validate_account_constraints(&journal, state)?;
+
+    let event = FinancialEvent::new(cmd, journal, state.next_sequence(), state.prev_hash());
+    state.event_log.append(event.clone())?;
+    state.apply_projection(&event)?;
+    state.audit_index.record(event.audit_record())?;
+    Ok(event.id)
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart LR
+    C[Financial Command] --> A[Authorization]
+    A --> I[Idempotency Gate]
+    I --> J[Journal Builder]
+    J --> B[Balance Validator]
+    B --> L[Immutable Event Log]
+    L --> P[Wallet and Ledger Projections]
+    L --> H[Hash-Chained Audit Trail]
+```
+
+### Failure modes
+
+Unbalanced journals, integer overflow, duplicate commands with mismatched payload hashes, closed accounts, unauthorized manual journals, attempted negative available balances, projection divergence, broken event-log checksums, and suspense entries that exceed policy all fail closed.
+
+### Security considerations
+
+Financial commands require scoped authorization, canonical request signing for external actors, strict idempotency, immutable logs, and separation of duties for manual corrections. Operators may append approved adjustments but may not edit prior ledger facts. Audit hashes include actor, command, journal, sequence, and previous hash.
+
+### Reconciliation rules
+
+- Recompute wallet balances from the ledger event log daily and during release certification.
+- Compare available, reserved, pending, locked, and total projections against ledger balances.
+- Verify per-asset debit totals equal credit totals over every reconciliation window.
+- Validate suspense, clearing, and treasury accounts against external statements or chain proofs.
+- Quarantine projections when replay hash differs from live hash.
+
+### Accounting invariants
+
+- `sum(debits(asset)) == sum(credits(asset))` for every journal.
+- No financial event exists without a causation command or certified system process.
+- No wallet mutation exists outside an immutable ledger event.
+- Available balance cannot be negative unless a later margin rule explicitly permits it.
+- Reserved balance cannot be negative.
+- Trading hot path consumes precomputed reservations and never calls the wallet database.
+
+### Testing strategy
+
+Use golden journals, property tests, replay tests, corruption tests, idempotency tests, and projection equivalence tests. Fuzz command ordering, duplicate delivery, crash points, and serialization boundaries. Certification includes full replay from genesis and projection hash comparison.
+
+### Codex implementation contract
+
+Implement canonical encoders, fixed-point checked arithmetic, balanced-journal validators, idempotency fixtures, replay fixtures, and migration vectors. Do not introduce floating point, unordered canonical output, mutable audit history, or wallet calls in matching-engine hot paths.
+
+### Review checklist
+
+- [ ] All monetary values are fixed-point integers.
+- [ ] Every mutation emits a balanced journal.
+- [ ] Idempotency behavior is deterministic and tested.
+- [ ] Audit records are immutable and hash chained.
+- [ ] Replay from genesis produces the same projection hashes.
+- [ ] Wallet persistence is not required by the trading hot path.
+
+## Chapter 2: Wallet Domain Model
+
+### Purpose
+
+Specify the wallet-facing domain model used to present user balances while preserving ledger authority. Wallets are projections, not sources of truth.
+
+### Scope
+
+Defines available balances, reserved balances, pending balances, settlement buckets, account ownership, asset metadata, wallet events, and read models used by APIs and risk checks.
+
+### Non-Goals
+
+- Define external deposit or withdrawal integrations.
+- Define margin account credit rules.
+- Permit direct mutation of wallet rows without ledger events.
+- Require the matching engine to synchronously query wallet storage.
+
+### Domain Model
+
+A user wallet is the per-user, per-asset projection of ledger accounts. It includes available funds, engine reservations, pending external settlement, and locked operational amounts. The ledger remains authoritative; wallet rows are cached projections that can be deleted and rebuilt from events.
+
+### Data Structures
+
+```rust
+struct WalletKey { user_id: u128, asset: AssetId }
+
+struct WalletProjection {
+    key: WalletKey,
+    available: Amount,
+    reserved: Amount,
+    pending_deposit: Amount,
+    pending_withdrawal: Amount,
+    locked: Amount,
+    last_ledger_sequence: u64,
+    projection_hash: [u8; 32],
+}
+
+enum WalletMutationKind {
+    CreditAvailable,
+    DebitAvailable,
+    Reserve,
+    ReleaseReservation,
+    ConsumeReservation,
+    CreditPending,
+    ClearPending,
+    Lock,
+    Unlock,
+}
+
+struct Reservation {
+    reservation_id: u128,
+    user_id: u128,
+    asset: AssetId,
+    amount: Amount,
+    status: ReservationStatus,
+    created_by_event: u128,
+}
+
+enum ReservationStatus { Active, PartiallyConsumed, Consumed, Released, Expired }
+```
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available
+    Available --> Reserved: place order
+    Reserved --> PartiallyConsumed: partial fill
+    Reserved --> Consumed: full fill
+    Reserved --> Released: cancel or expire
+    PartiallyConsumed --> Consumed
+    PartiallyConsumed --> Released
+    Released --> Available
+```
+
+### Algorithms
+
+Projection update applies ledger events in sequence, maps ledger lines to wallet buckets, applies checked integer deltas, validates non-negative constraints, recomputes a canonical projection hash, and stores the last applied ledger sequence. Reservation creation debits available and credits reserved through a balanced journal, exports reservation id and amount to the trading engine, and requires matching to consume only exported reservation state.
+
+### Rust-style pseudocode
+
+```rust
+fn apply_wallet_line(wallet: &mut WalletProjection, mutation: WalletMutationKind, amount: Amount) -> Result<(), Error> {
+    match mutation {
+        WalletMutationKind::CreditAvailable => wallet.available = checked_add(wallet.available, amount)?,
+        WalletMutationKind::DebitAvailable => wallet.available = checked_sub(wallet.available, amount)?,
+        WalletMutationKind::Reserve => {
+            wallet.available = checked_sub(wallet.available, amount)?;
+            wallet.reserved = checked_add(wallet.reserved, amount)?;
+        }
+        WalletMutationKind::ReleaseReservation => {
+            wallet.reserved = checked_sub(wallet.reserved, amount)?;
+            wallet.available = checked_add(wallet.available, amount)?;
+        }
+        WalletMutationKind::ConsumeReservation => wallet.reserved = checked_sub(wallet.reserved, amount)?,
+        _ => apply_non_trading_bucket(wallet, mutation, amount)?,
+    }
+    ensure_non_negative(wallet.available)?;
+    ensure_non_negative(wallet.reserved)?;
+    wallet.projection_hash = wallet.canonical_hash();
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TB
+    L[Ledger Event Log] --> W[Wallet Projector]
+    W --> A[Available Projection]
+    W --> R[Reserved Projection]
+    W --> P[Pending Projection]
+    R --> E[Reservation Export]
+    E --> M[Matching Engine]
+    M -. no wallet DB call .-> E
+```
+
+### Failure modes
+
+Out-of-order projection, reservation export mismatch, negative available or reserved bucket, wallet row mutation without ledger sequence, stale reservation snapshot, duplicate reservation consumption, and rebuilt projection hash mismatch.
+
+### Security considerations
+
+Wallet APIs expose projections only and must identify ledger sequence freshness. Reservation commands require user authorization or certified system authority. Administrative locks require dual control and explicit audit reasons. API responses must not imply finality before ledger event commitment.
+
+### Reconciliation rules
+
+- Wallet `available + reserved + pending + locked` equals mapped ledger balances by user and asset.
+- Reservation records sum to reserved wallet balances by user and asset.
+- Every active reservation references an immutable ledger event.
+- Projection `last_ledger_sequence` monotonically increases.
+
+### Accounting invariants
+
+Wallet projection is derivable from ledger events only; reserved funds are not spendable; consumed reservations correspond to clearing entries; released reservations restore available balances exactly once; no reservation may be consumed after release.
+
+### Testing strategy
+
+Test projection rebuilds, reservation lifecycle transitions, cancellation races, duplicate reservation commands, partial fills, replay after crash, stale export rejection, and API sequence consistency. Property tests generate order, cancel, fill, deposit, withdrawal, and lock events and assert wallet-ledger equivalence.
+
+### Codex implementation contract
+
+Implement wallets as deterministic projections with sequence checkpoints and canonical hashes. Do not treat wallet tables as authoritative. Do not add direct SQL balance increments outside the event projector. Do not introduce matching-engine database reads for balance checks.
+
+### Review checklist
+
+- [ ] Wallet rows can be rebuilt from ledger events.
+- [ ] Reservation lifecycle is complete and deterministic.
+- [ ] Available and reserved balances never go negative.
+- [ ] API responses include ledger sequence or freshness metadata.
+- [ ] Matching hot path uses exported reservations only.
+
+## Chapter 3: Double-Entry Ledger Architecture
+
+### Purpose
+
+Define the double-entry architecture that guarantees every movement balances, every mutation is auditable, and every projection can be certified by replay.
+
+### Scope
+
+Covers chart of accounts, journal transactions, debit/credit semantics, append-only event storage, canonical serialization, projection pipelines, correction journals, and ledger partitioning.
+
+### Non-Goals
+
+- Prescribe a specific database vendor.
+- Define external custodian schemas.
+- Permit single-entry balance adjustments.
+- Define tax-lot accounting.
+
+### Domain Model
+
+The ledger is the source of truth. A journal transaction contains two or more lines and is valid only when balanced per asset. The chart of accounts maps business concepts to normal balance accounts. Wallet, treasury, revenue, expense, and suspense projections derive from the same event stream.
+
+### Data Structures
+
+```rust
+struct ChartOfAccounts {
+    accounts: BTreeMap<AccountId, LedgerAccount>,
+    version: u32,
+    effective_sequence: u64,
+}
+
+struct LedgerEventHeader {
+    event_id: u128,
+    sequence: u64,
+    previous_hash: [u8; 32],
+    payload_hash: [u8; 32],
+    schema_version: u16,
+}
+
+struct LedgerEvent {
+    header: LedgerEventHeader,
+    journal: JournalTransaction,
+    authz_proof: AuthzProof,
+    idempotency_key: [u8; 32],
+}
+
+struct ProjectionCheckpoint {
+    projection_name: &'static str,
+    last_sequence: u64,
+    state_hash: [u8; 32],
+}
+```
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> DraftJournal
+    DraftJournal --> ValidatingAccounts
+    ValidatingAccounts --> ValidatingBalance
+    ValidatingBalance --> Sealed
+    Sealed --> Appended
+    Appended --> Projected
+    Projected --> Certified
+    DraftJournal --> Rejected
+    ValidatingAccounts --> Rejected
+    ValidatingBalance --> Rejected
+```
+
+### Algorithms
+
+Balanced journal validation groups lines by asset, sums debits and credits with checked arithmetic, rejects zero-line or one-line journals, validates account assets and status, and verifies post-state constraints. Correction posting appends an exact reversal journal followed by a replacement journal linked to approvals; the original event remains immutable.
+
+### Rust-style pseudocode
+
+```rust
+fn validate_balanced_by_asset(journal: &JournalTransaction) -> Result<(), Error> {
+    if journal.lines.len() < 2 { return Err(Error::TooFewLines); }
+    let mut totals: BTreeMap<AssetId, (Amount, Amount)> = BTreeMap::new();
+    for line in &journal.lines {
+        if line.debit.0 < 0 || line.credit.0 < 0 { return Err(Error::NegativeLineAmount); }
+        if line.debit.0 == 0 && line.credit.0 == 0 { return Err(Error::ZeroLine); }
+        let entry = totals.entry(line.asset).or_insert((Amount(0), Amount(0)));
+        entry.0 = checked_add(entry.0, line.debit)?;
+        entry.1 = checked_add(entry.1, line.credit)?;
+    }
+    for (_asset, (debits, credits)) in totals {
+        if debits != credits { return Err(Error::UnbalancedJournal); }
+    }
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart LR
+    COA[Chart of Accounts] --> JB[Journal Builder]
+    CMD[Command] --> JB
+    JB --> V[Validation]
+    V --> EL[Append-only Ledger Event Log]
+    EL --> WP[Wallet Projection]
+    EL --> RP[Revenue Projection]
+    EL --> TP[Treasury Projection]
+    EL --> AR[Audit Replay]
+```
+
+```mermaid
+sequenceDiagram
+    participant API
+    participant Ledger
+    participant Log
+    participant Projector
+    API->>Ledger: submit command
+    Ledger->>Ledger: build balanced journal
+    Ledger->>Log: append sealed event
+    Log->>Projector: deliver sequence n
+    Projector->>Projector: update deterministic projection
+```
+
+### Failure modes
+
+Single-sided posting, cross-asset lines balanced incorrectly, account asset mismatch, chart-of-accounts version ambiguity, correction overwriting an original event, noncanonical serialization changing hashes, and projection consuming events before durable append.
+
+### Security considerations
+
+Ledger append permission is highly privileged and isolated behind command-specific services. Manual journals require maker-checker approval, reason codes, and limits. Event-log storage is tamper evident through checksums, hash chaining, backups, and replay verification.
+
+### Reconciliation rules
+
+- Replay all ledger events and compare projection checkpoints.
+- Validate chart-of-accounts version used by each event.
+- Confirm correction journals link to original event ids and approval records.
+- Compare ledger totals with wallet, treasury, revenue, and suspense projections.
+
+### Accounting invariants
+
+Every journal has at least two nonzero lines; debits equal credits for each asset; event sequence is gapless and strictly increasing; event hashes commit to previous hash, header, journal, and authorization proof; correction journals reverse and replace rather than edit.
+
+### Testing strategy
+
+Use unit tests for line validation, property tests for generated journals, replay tests for projection equivalence, migration tests for chart-of-accounts changes, and corruption tests for sequence gaps, altered bytes, and reordered events.
+
+### Codex implementation contract
+
+Model ledger writes as append-only events with canonical serialization and deterministic BTreeMap-style ordering. Any schema change must include versioned encoders, migration tests, and replay compatibility fixtures.
+
+### Review checklist
+
+- [ ] Journals balance per asset.
+- [ ] Ledger events are append-only and hash chained.
+- [ ] Chart-of-accounts versions are explicit.
+- [ ] Corrections are reversal/replacement events.
+- [ ] Projection checkpoints are replay-verifiable.
+
+## Chapter 4: Balance Invariants and Reconciliation
+
+### Purpose
+
+Specify the invariants and reconciliation processes that prove HermesNet has conserved every asset and can explain every balance at any sequence.
+
+### Scope
+
+Covers online invariant checks, batch reconciliation, replay certification, suspense handling, external statement matching, discrepancy quarantine, and operational sign-off.
+
+### Non-Goals
+
+- Define external exchange-rate valuation.
+- Define regulatory report formats.
+- Resolve business disputes without audit review.
+- Permit automatic deletion of discrepancies.
+
+### Domain Model
+
+Reconciliation compares independently derived views of the same financial facts: ledger events, wallet projections, treasury balances, external statements, and audit checkpoints. A discrepancy is a first-class object with lifecycle, owner, evidence, and resolution journals.
+
+### Data Structures
+
+```rust
+struct ReconciliationRun {
+    run_id: u128,
+    kind: ReconciliationKind,
+    from_sequence: u64,
+    to_sequence: u64,
+    status: ReconciliationStatus,
+    evidence_hash: [u8; 32],
+}
+
+enum ReconciliationKind { OnlineInvariant, HourlyProjection, DailyExternal, ReleaseCertification }
+enum ReconciliationStatus { Running, Passed, Failed, Quarantined }
+
+struct Discrepancy {
+    discrepancy_id: u128,
+    asset: AssetId,
+    account: Option<AccountId>,
+    expected: Amount,
+    observed: Amount,
+    first_sequence: u64,
+    status: DiscrepancyStatus,
+}
+
+enum DiscrepancyStatus { Open, Investigating, Corrected, WaivedWithApproval }
+```
+
+### State Machines
+
+```mermaid
+stateDiagram-v2
+    [*] --> Scheduled
+    Scheduled --> Running
+    Running --> Passed
+    Running --> Failed
+    Failed --> Quarantined
+    Quarantined --> Investigating
+    Investigating --> Corrected
+    Investigating --> WaivedWithApproval
+    Corrected --> Passed
+    WaivedWithApproval --> Passed
+```
+
+### Algorithms
+
+Online invariant checks validate every journal before append, apply affected account deltas to a shadow invariant accumulator, reject non-margin account violations, and emit invariant hashes. Batch reconciliation replays ledger events from a certified checkpoint, rebuilds projections, compares rebuilt and persisted hashes, matches external statements to clearing and treasury accounts, creates discrepancy records, and quarantines affected accounts or assets when policy thresholds are exceeded.
+
+### Rust-style pseudocode
+
+```rust
+fn reconcile_range(range: SequenceRange, sources: &Sources) -> Result<ReconciliationRun, Error> {
+    let rebuilt = replay_ledger(range, sources.event_log)?;
+    let persisted = sources.projections.load_at(range.end)?;
+
+    for asset in rebuilt.assets() {
+        ensure_eq(rebuilt.total_debits(asset), rebuilt.total_credits(asset))?;
+    }
+
+    let diffs = compare_projection_hashes(&rebuilt, &persisted)?;
+    if !diffs.is_empty() {
+        let run = create_failed_run(range, diffs);
+        quarantine_affected_accounts(&run)?;
+        return Ok(run);
+    }
+
+    compare_external_statements(&rebuilt.treasury, sources.external_statements)?;
+    Ok(create_passed_run(range, rebuilt.evidence_hash()))
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    EL[Event Log] --> R[Replay Engine]
+    R --> RW[Rebuilt Wallet]
+    R --> RT[Rebuilt Treasury]
+    WP[Persisted Wallet] --> C[Comparator]
+    TP[Persisted Treasury] --> C
+    RW --> C
+    RT --> C
+    C -->|match| PASS[Certified]
+    C -->|mismatch| D[Discrepancy]
+    D --> Q[Quarantine]
+```
+
+### Failure modes
+
+Ledger balances while wallet projection diverges, external statement omissions or duplicates, noncanonical event decoder, discrepancy threshold exceeded without quarantine, aged suspense balance, and irreproducible evidence artifacts.
+
+### Security considerations
+
+Reconciliation evidence is immutable and access controlled. Investigators receive read access to evidence and write access only through approved correction workflows. External statement imports are authenticated and stored with source hashes.
+
+### Reconciliation rules
+
+- Run online checks for every journal before append.
+- Run projection reconciliation at least hourly.
+- Run external treasury reconciliation at least daily per asset and venue.
+- Run full genesis replay before release certification.
+- Escalate any unexplained discrepancy to quarantine.
+- Resolve discrepancies only through auditable reversal, replacement, or approved waiver records.
+
+### Accounting invariants
+
+Global per-asset ledger sum is conserved across internal movements; user wallet totals equal user ledger account totals; treasury ledger balances equal internal records of external custody subject only to documented in-flight transfers; suspense balances have owners, reasons, and age limits; reconciliation outputs are reproducible from immutable inputs.
+
+### Testing strategy
+
+Test clean reconciliations, intentional projection drift, missing external statements, duplicate external statements, corrupted evidence hashes, quarantine triggers, correction journals, and replay from genesis. Property tests generate random balanced journals and verify reconciliation remains stable under deterministic replay.
+
+### Codex implementation contract
+
+Implement reconciliation as deterministic replay and comparison, not ad hoc database totals. Add evidence hashes, discrepancy lifecycle tests, quarantine tests, and full replay fixtures. Do not add hidden mutators that repair balances without ledger events.
+
+### Review checklist
+
+- [ ] Online invariant checks run before append.
+- [ ] Batch reconciliation rebuilds projections from events.
+- [ ] Discrepancies are durable, owned, and auditable.
+- [ ] Quarantine behavior is deterministic and tested.
+- [ ] External statements are authenticated and hash recorded.
+
+## Chapter 5: Deposit Processing
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define deterministic deposit recognition from external evidence to credited wallet availability.
+- Scope: Pending deposits, confirmations, clearing accounts, idempotency, and reversals.
+- Domain model TODO: External deposit evidence, clearing account, pending deposit, credited deposit.
+- Data structures TODO: Deposit intent, chain/bank reference, confirmation record, journal mapping.
+- State machines TODO: Observed → pending → confirmed → credited → reconciled; include rejected and reversed paths.
+- Algorithms TODO: Confirmation counting, idempotent crediting, suspense routing, reorg/reversal handling.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 6: Withdrawal Processing
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define safe withdrawal reservation, approval, signing, broadcast, settlement, and failure handling.
+- Scope: User requests, holds, compliance gates, treasury funding, external settlement, cancellation, and reversal.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 7: Treasury and Hot/Cold Wallet Management
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define treasury custody accounts, hot/cold inventory, sweeping, funding, and operational limits.
+- Scope: Internal treasury ledgers, custody proofs, wallet inventory, threshold policy, signer segregation.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 8: Internal Transfers
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define transfers between users, subaccounts, system accounts, and operational buckets.
+- Scope: Same-asset internal movements, authorization, idempotency, restrictions, and audit evidence.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 9: Insurance Fund Accounting
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define insurance fund funding, claims, losses, recoveries, and audit controls.
+- Scope: Fund accounts, covered events, allocation rules, governance approvals, and reporting projections.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 10: Fee, Rebate and Revenue Accounting
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define fee assessment, rebates, discounts, revenue recognition, and correction handling.
+- Scope: Maker/taker fees, withdrawal fees, rebates, promotions, fee schedules, revenue projections.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 11: Financial Reporting
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define deterministic financial reporting projections and evidence packages.
+- Scope: Balance reports, activity statements, revenue reports, treasury reports, audit exports.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Chapter 12: Accounting Certification Tests
+
+TODO: Expand this chapter in a later Volume IV iteration.
+
+### Structured outline
+
+- Purpose: Define certification tests proving ledger correctness, replay determinism, and reconciliation integrity.
+- Scope: Golden journals, fuzz tests, replay tests, corruption tests, migration tests, benchmark thresholds.
+- Domain model TODO.
+- Data structures TODO.
+- State machines TODO.
+- Algorithms TODO.
+- Rust-style pseudocode TODO.
+- Mermaid diagrams TODO.
+- Failure modes TODO.
+- Security considerations TODO.
+- Reconciliation rules TODO.
+- Accounting invariants TODO.
+- Testing strategy TODO.
+- Codex implementation contract TODO.
+- Review checklist TODO.
+
+## Volume IV Initial Expansion Summary
+
+- Added the major Volume IV specification for wallet, ledger, and financial accounting after Volume III.
+- Fully expanded Chapters 1–4: Financial Accounting Principles; Wallet Domain Model; Double-Entry Ledger Architecture; Balance Invariants and Reconciliation.
+- Added structured TODO outlines for Chapters 5–12 so later iterations can expand deposit, withdrawal, treasury, transfers, insurance, fees, reporting, and certification tests without altering the Volume IV chapter map.
+- Preserved HermesNet principles: fixed-point integers only, deterministic accounting, immutable audit trails, event-sourced projections, no double spend, non-negative balances unless future margin rules permit otherwise, balanced ledger movements, auditable financial mutations, and no wallet database calls in the trading hot path.
+
 
 ## Volumes I–III Freeze Note
 
