@@ -1484,478 +1484,1586 @@ Metrics include open positions by contract, gross long/short exposure, realized 
 
 ### Purpose
 
-Define the deterministic liquidation system for accounts that breach maintenance margin.
+Liquidation protects the venue from negative equity by reducing or closing positions whose fixed-point account equity no longer satisfies maintenance margin. It is a deterministic risk workflow, not an operator action.
 
-### Future subsections
+### Scope
 
-- Liquidation eligibility.
-- Liquidation price calculation.
-- Bankruptcy price.
-- Partial liquidation.
-- Full liquidation.
-- Liquidation order generation.
-- Insurance fund interaction.
-- Liquidation fee accounting.
-- Position transfer rules.
-- Halt and resume behavior.
-- Replay and recovery.
-- Operator controls and audit requirements.
+Covers liquidation eligibility, margin ratio calculation, maintenance margin breach detection, mark price dependency, partial and full liquidation, liquidation and bankruptcy prices, insurance fund interaction, liquidation order generation, deterministic priority, market halt/oracle failure/restart behaviour, forced reduce-only mode, notifications, EngineEvents, cold ledger projection, risk cache updates, and settlement deltas.
 
-### Required algorithms
+### Business Context
 
-- Maintenance breach detection.
-- Liquidation priority ordering.
-- Partial liquidation sizing.
-- Bankruptcy price calculation.
-- Insurance fund debit and credit calculation.
-- Deterministic residual allocation.
+Leveraged futures accounts may become under-collateralized after mark price movement, funding, fees, collateral haircut changes, or position changes. Liquidation reduces exposure before losses exceed collateral. The process must be explainable to users and auditors from the event log alone.
 
-### Required state machines
+### Engineering Context
 
-- Account liquidation lifecycle.
-- Liquidation order lifecycle.
-- Insurance fund claim lifecycle.
-- Failed liquidation escalation lifecycle.
+The Liquidation Engine consumes hash-chained `MarkPriceUpdated`, `MarginRecalculated`, `FundingSettled`, `PositionUpdated`, and `CollateralUpdated` events. It never calls a database, oracle, Kafka, or wallet before a decision. Liquidation orders are generated as deterministic reduce-only commands routed to the relevant book-local single writer.
 
-### Required Rust modules
+### Responsibilities
 
-- `liquidation::eligibility`
-- `liquidation::sizing`
-- `liquidation::orders`
-- `liquidation::insurance`
-- `liquidation::replay`
-- `liquidation::tests`
+- Evaluate eligibility using fixed-point equity, maintenance margin, and mark price snapshots.
+- Place accounts into forced reduce-only mode once liquidation is triggered.
+- Select partial liquidation before full liquidation when configured thresholds allow recovery.
+- Calculate liquidation price and bankruptcy price using integer arithmetic and explicit rounding.
+- Emit immutable liquidation EngineEvents and settlement deltas.
+- Update hot risk cache and cold ledger projections from the same events.
+- Interact with the insurance fund only after realized bankruptcy loss is known.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Margin breach to liquidation flow.
-- Partial liquidation loop.
-- Insurance fund settlement sequence.
-- Recovery after restart during liquidation.
+- Manual trader negotiation, discretionary price improvement, or socialized loss outside ADL.
+- Floating-point risk calculation.
+- Cross-book atomic liquidation.
+- Operator mutation of account equity.
 
-### Required certification tests
+### Domain Model
 
-- Healthy account never liquidates.
-- Maintenance breach triggers deterministic liquidation.
-- Partial liquidation restores margin when possible.
-- Bankruptcy path charges insurance fund.
-- Restart cannot duplicate liquidation orders.
+- `LiquidationCase`: account, margin mode, contract set, trigger event, breach ratio, phase, and deterministic case id.
+- `LiquidationSlice`: quantity selected for partial or full close.
+- `LiquidationOrder`: reduce-only IOC or venue-defined liquidation order with book-local sequence.
+- `BankruptcyLoss`: residual negative equity after liquidation execution and fees.
+- `InsuranceClaim`: deterministic debit request against the insurance fund.
+- `SettlementDelta`: auditable collateral, realized PnL, fee, and fund movement intent.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 5 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct LiquidationCaseId { account_id: AccountId, trigger_seq: u64, contract_id: ContractId }
+struct LiquidationCase { id: LiquidationCaseId, status: LiquidationStatus, margin_ratio_ppm: i128, trigger_mark: Fixed, priority_key: LiquidationPriorityKey }
+struct LiquidationPriorityKey { deficit: i128, account_id: AccountId, contract_id: ContractId, trigger_seq: u64 }
+struct LiquidationOrder { case_id: LiquidationCaseId, contract_id: ContractId, side: Side, qty: i128, limit_price: Fixed, reduce_only: bool, book_seq: Option<u64> }
+struct SettlementDelta { account_id: AccountId, asset: AssetId, amount: i128, reason: SettlementReason, event_id: EventId }
+```
 
----
+All monetary values use signed integers at the contract or asset scale. Priority queues compare tuple fields lexicographically; no hash-map iteration order is allowed.
+
+### State Machines
+
+Liquidation lifecycle:
+
+`Healthy -> Watch -> Eligible -> ForcedReduceOnly -> PartialLiquidating -> Recheck -> FullLiquidating -> InsuranceReview -> Closed | ADLRequired | HaltedBlocked`.
+
+Liquidation order lifecycle:
+
+`Generated -> SubmittedToBook -> Accepted -> PartiallyFilled -> Filled | Expired -> Settled -> Replayed`.
+
+Market halt permits eligibility and forced reduce-only events but blocks new aggressing liquidation orders unless the halt policy explicitly permits risk-reducing auctions. Oracle failure freezes the last valid mark and prevents new eligibility decisions once staleness exceeds the configured bound; already emitted cases replay normally.
+
+### Algorithms
+
+1. Build account equity from collateral value plus unrealized PnL minus fees and funding liabilities.
+2. Calculate maintenance margin from absolute position notional, tier schedule, and concentration add-ons.
+3. `margin_ratio = equity / maintenance_margin` represented in parts-per-million with floor rounding toward adverse risk.
+4. Trigger eligibility when `equity <= maintenance_margin` or configured ratio threshold is breached.
+5. Sort cases by largest deficit, then earliest trigger book sequence, then account id, then contract id.
+6. Execute partial liquidation slices until margin ratio recovers above exit threshold or partial budget is exhausted.
+7. Execute full liquidation for residual unsafe positions.
+8. Apply insurance fund only to deterministic bankruptcy loss after settlement deltas are computed.
+
+### Rust-style pseudocode
+
+```rust
+fn calculate_margin_ratio(equity: Fixed, maintenance: Fixed) -> i128 {
+    if maintenance.value <= 0 { return i128::MAX; }
+    div_floor(equity.value * 1_000_000, maintenance.value)
+}
+
+fn calculate_liquidation_price(pos: Position, collateral: Fixed, mm_rate_ppm: i128) -> Fixed {
+    let q = pos.signed_qty; let entry = pos.entry_price.value; let scale = pos.entry_price.scale;
+    let mm = mul_div_floor(abs(q) * entry, mm_rate_ppm, 1_000_000);
+    let numerator = q * entry - collateral.value + sign(q) * mm;
+    Fixed { value: div_floor(numerator, q), scale }
+}
+
+fn calculate_bankruptcy_price(pos: Position, collateral: Fixed) -> Fixed {
+    let numerator = pos.signed_qty * pos.entry_price.value - collateral.value;
+    Fixed { value: div_floor(numerator, pos.signed_qty), scale: pos.entry_price.scale }
+}
+
+fn evaluate_liquidation(acct: AccountRisk, mark: MarkPrice) -> Option<LiquidationCase> {
+    require_fresh_mark(mark)?;
+    let equity = acct.equity_at(mark);
+    let maintenance = acct.maintenance_margin_at(mark);
+    let ratio = calculate_margin_ratio(equity, maintenance);
+    if equity.value <= maintenance.value { Some(new_case(acct, mark, ratio)) } else { None }
+}
+
+fn trigger_liquidation(case: LiquidationCase, cache: &mut RiskCache) -> Vec<EngineEvent> {
+    cache.force_reduce_only(case.id.account_id);
+    vec![emit_liquidation_event(case, LiquidationEventKind::Triggered)]
+}
+
+fn execute_partial_liquidation(case: &mut LiquidationCase, book: &mut BookCommandSink) {
+    for slice in deterministic_slices(case) { book.submit(make_liq_order(case, slice)); }
+}
+
+fn execute_full_liquidation(case: &mut LiquidationCase, book: &mut BookCommandSink) {
+    let slice = full_remaining_slice(case);
+    book.submit(make_liq_order(case, slice));
+}
+
+fn apply_insurance_fund(loss: Fixed, fund: &mut InsuranceFund) -> InsuranceResult {
+    let debit = min(fund.available.value, max(0, loss.value));
+    fund.available.value -= debit;
+    if debit == loss.value { InsuranceResult::Covered(debit) } else { InsuranceResult::AdlRequired(loss.value - debit) }
+}
+
+fn emit_liquidation_event(case: LiquidationCase, kind: LiquidationEventKind) -> EngineEvent {
+    EngineEvent::Liquidation { case_id: case.id, kind, margin_ratio_ppm: case.margin_ratio_ppm, hash_prev: current_hash() }
+}
+
+fn replay_liquidation(events: &[EngineEvent], state: &mut LiquidationProjection) {
+    for e in events { state.apply(e); }
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+stateDiagram-v2
+    Healthy --> Watch: ratio near threshold
+    Watch --> Eligible: maintenance breach
+    Eligible --> ForcedReduceOnly: emit trigger
+    ForcedReduceOnly --> PartialLiquidating
+    PartialLiquidating --> Recheck
+    Recheck --> Closed: ratio restored
+    Recheck --> FullLiquidating: still unsafe
+    FullLiquidating --> InsuranceReview
+    InsuranceReview --> Closed: fund covers loss
+    InsuranceReview --> ADLRequired: fund exhausted
+```
+
+```mermaid
+sequenceDiagram
+    participant Mark
+    participant Risk
+    participant Liq
+    participant Book
+    Mark->>Risk: MarkPriceUpdated
+    Risk->>Liq: MarginRecalculated
+    Liq->>Liq: deterministic eligibility + priority
+    Liq->>Risk: ForcedReduceOnly
+    Liq->>Book: reduce-only liquidation command
+    Book-->>Liq: fill EngineEvents
+```
+
+```mermaid
+flowchart TD
+    A[Eligible Case] --> B[Compute deficit]
+    B --> C[Select deterministic slice]
+    C --> D[Generate reduce-only order]
+    D --> E[Apply fills]
+    E --> F[Recalculate margin ratio]
+    F -->|Restored| G[Close case]
+    F -->|Still unsafe| C
+```
+
+```mermaid
+flowchart LR
+    Loss[Bankruptcy Loss] --> Claim[Insurance Claim]
+    Claim --> Fund{Fund balance sufficient?}
+    Fund -->|yes| Debit[Debit fund and emit settlement delta]
+    Fund -->|no| Partial[Debit available balance]
+    Partial --> ADL[Emit ADLRequired]
+```
+
+### Invariants
+
+- Liquidation never increases absolute position size.
+- Every liquidation order is reduce-only and references exactly one case id.
+- A case id is emitted once and is idempotent on replay.
+- Insurance fund debits cannot exceed available fund balance.
+- Settlement deltas sum to realized PnL, fees, and insurance movement exactly.
+
+### Failure Modes
+
+Stale oracle, market halt, book restart, duplicate trigger, partial fill, insufficient insurance fund, cold projection lag, and risk cache corruption are handled by deterministic events and reconciliation alerts.
+
+### Replay Behaviour
+
+Replay consumes the original trigger mark, priority key, slices, fills, fund debits, and settlement deltas. It must not re-query current marks or rebuild priority from wall-clock time. Duplicate command submission is prevented by case id and liquidation order id.
+
+### Recovery
+
+On restart, rebuild cases from the hash chain, restore forced reduce-only flags, reconcile submitted order ids with book-local events, and continue from the last durable lifecycle state. Cold ledger projection catches up from settlement deltas; it does not invent corrections.
+
+### Performance Considerations
+
+Eligibility uses precomputed risk snapshots and bounded tier schedules. Priority queues are partitioned by contract. Liquidation work is outside matching hot loops; book submission remains single-writer and lock-free relative to matching.
+
+### Security Considerations
+
+Operators cannot skip accounts, reorder priority, or edit prices. All intervention is via signed configuration events. Notifications are post-decision and cannot block liquidation.
+
+### Observability
+
+Metrics include liquidation queue depth, cases by status, margin deficit, partial/full ratio, oracle staleness blocks, insurance fund debits, replay divergence, and cold projection lag.
+
+### Testing Strategy
+
+Use golden vectors for price, bankruptcy, partial sizing, fund debit, replay idempotence, market halt, oracle staleness, and restart between order generation and fill.
+
+### Property-Based Tests
+
+Generate positions, marks, tiers, collateral, fills, and funding deltas. Assert no position increase, conservation of settlement deltas, deterministic priority order, and replay equivalence for all seeds.
+
+### Acceptance Criteria
+
+A maintenance breach deterministically produces forced reduce-only state, auditable liquidation events, correct settlement deltas, insurance fund interaction when required, cold ledger projection, and identical replay state.
+
+### Codex Implementation Contract
+
+Implement only integer arithmetic; add no database, Kafka, network, floating point, or locks to the decision path. New events must be immutable, hash-chained, versioned, and covered by golden vectors.
+
+### Architect Review Checklist
+
+- [ ] Eligibility and mark staleness rules are explicit.
+- [ ] Partial/full liquidation and bankruptcy math have vectors.
+- [ ] Halt, oracle failure, and restart behaviour are deterministic.
+- [ ] Insurance and ADL handoff are auditable.
+- [ ] Risk cache and cold ledger projections derive from events.
+
 
 ## Chapter 6 — Auto-Deleveraging (ADL)
 
 ### Purpose
 
-Define deterministic auto-deleveraging when liquidation and insurance fund capacity are insufficient.
+Define the deterministic ADL subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- ADL eligibility.
-- Counterparty ranking.
-- Profit and leverage ranking formula.
-- ADL execution price.
-- ADL event emission.
-- User notification requirements.
-- Ledger settlement.
-- Replay and recovery.
+Includes ADL purpose, trigger conditions, insurance fund exhaustion, bankruptcy loss, counterparty selection, leverage/profit ranking, deterministic tie-breakers, ADL queue, execution, notification, EngineEvents, settlement, audit trail, replay, market halt, failover, and abuse prevention. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- ADL rank score calculation.
-- Stable tie-break ordering.
-- Counterparty quantity selection.
-- ADL settlement accounting.
-- Insurance fund exhaustion detection.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- ADL trigger lifecycle.
-- ADL candidate lifecycle.
-- ADL settlement lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `adl::ranking`
-- `adl::selection`
-- `adl::settlement`
-- `adl::events`
-- `adl::replay`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Insurance exhaustion to ADL flow.
-- Counterparty ranking and selection.
-- ADL settlement sequence.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Ranking is deterministic.
-- Tie-breaks are stable.
-- ADL reduces only selected counterparties.
-- Settlement balances ledger entries.
-- Replay cannot select different counterparties.
+Core entities include `adlAccount`, `adlSnapshot`, `adlDecision`, `adlEvent`, `adlConfigVersion`, `adlSettlementDelta`, and `adlAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 6 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct AutoDeleveragingADLSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct AutoDeleveragingADLDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Auto-Deleveraging (ADL) lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn evaluate_adl_need(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn rank_adl_candidates(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn select_adl_counterparties(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn execute_adl(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn settle_adl(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn emit_adl_event(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn replay_adl(ctx: &mut AutoDeleveragingADLContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_adl_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[ADL trigger flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[ADL candidate ranking] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[ADL execution sequence] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 7 — Portfolio Margin
 
 ### Purpose
 
-Define future portfolio-level margining for correlated derivatives exposure.
+Define the deterministic portfolio margin subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Portfolio risk model boundaries.
-- Scenario grid specification.
-- Stress loss calculation.
-- Correlation assumptions.
-- Product eligibility.
-- Collateral offsets.
-- Model governance.
-- Replayable scenario events.
+Includes eligible accounts, eligibility criteria, risk arrays, scenario analysis, stress scenarios, correlation assumptions, cross-product spot/futures/options offsets, haircut model, concentration and liquidity risk, stress loss, net margin requirement, portfolio risk score, margin increase/decrease, rejection, and regulatory auditability. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Scenario loss calculation.
-- Worst-case loss selection.
-- Portfolio margin floor.
-- Concentration add-on.
-- Deterministic scenario versioning.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Portfolio margin eligibility lifecycle.
-- Model version lifecycle.
-- Scenario publication lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `portfolio_margin::scenario`
-- `portfolio_margin::model`
-- `portfolio_margin::eligibility`
-- `portfolio_margin::replay`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Portfolio margin calculation pipeline.
-- Model version activation.
-- Scenario replay flow.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Scenario ordering is deterministic.
-- Worst-case selection is stable.
-- Margin floor cannot be bypassed.
-- Model version replay matches live.
+Core entities include `portfolio_marginAccount`, `portfolio_marginSnapshot`, `portfolio_marginDecision`, `portfolio_marginEvent`, `portfolio_marginConfigVersion`, `portfolio_marginSettlementDelta`, and `portfolio_marginAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 7 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct PortfolioMarginSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct PortfolioMarginDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Portfolio Margin lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn calculate_portfolio_margin(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn build_risk_scenarios(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn evaluate_scenario_loss(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn apply_offsets(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn apply_haircuts(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn validate_portfolio_margin_invariants(ctx: &mut PortfolioMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_portfolio_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[portfolio margin calculation flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[risk scenario evaluation] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[offset application flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 8 — Cross Margin
 
 ### Purpose
 
-Define cross-margin behavior where eligible collateral supports multiple positions.
+Define the deterministic cross margin subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Cross account scope.
-- Shared collateral pool.
-- Position aggregation.
-- Cross margin risk thresholds.
-- Withdrawal restrictions.
-- Transfer restrictions.
-- Liquidation interaction.
+Includes shared collateral pool, collateral valuation, margin allocation, risk contribution, unrealized PnL, funding treatment, liquidation interaction, haircuts, collateral eligibility, account-level margin ratio, cross-product risk, failure modes, and negative equity prevention. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Shared equity calculation.
-- Cross-position margin aggregation.
-- Withdrawal availability calculation.
-- Cross liquidation prioritization.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Cross account margin state.
-- Cross collateral reservation state.
-- Cross liquidation escalation state.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `cross_margin::equity`
-- `cross_margin::reservation`
-- `cross_margin::withdrawal_guard`
-- `cross_margin::liquidation`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Cross collateral pool flow.
-- Withdrawal pre-check flow.
-- Cross margin liquidation flow.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Shared collateral supports multiple positions deterministically.
-- Withdrawal cannot breach maintenance margin.
-- Cross liquidation order is deterministic.
-- Replay reproduces shared equity.
+Core entities include `cross_marginAccount`, `cross_marginSnapshot`, `cross_marginDecision`, `cross_marginEvent`, `cross_marginConfigVersion`, `cross_marginSettlementDelta`, and `cross_marginAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 8 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct CrossMarginSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct CrossMarginDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Cross Margin lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn calculate_cross_margin(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn value_collateral_pool(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn allocate_margin(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn update_cross_margin_ratio(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn apply_cross_margin_funding(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn validate_cross_margin_invariants(ctx: &mut CrossMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_cross_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[cross margin calculation] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[shared collateral pool] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[liquidation interaction] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 9 — Isolated Margin
 
 ### Purpose
 
-Define isolated margin behavior where collateral is assigned to a specific position or contract.
+Define the deterministic isolated margin subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Isolated margin account model.
-- Margin add and remove.
-- Isolated leverage changes.
-- Isolated liquidation price.
-- Auto top-up policy.
-- Position close and residual release.
+Includes position-level collateral, transfer in/out, isolated leverage, isolated liquidation price, top-up, reduction, isolated risk boundary, failure isolation, liquidation interaction, deterministic accounting, and user adjustment workflow. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Isolated margin assignment.
-- Isolated available margin calculation.
-- Isolated liquidation price calculation.
-- Residual margin release.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Isolated position margin state.
-- Isolated margin transfer lifecycle.
-- Isolated liquidation lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `isolated_margin::account`
-- `isolated_margin::transfer`
-- `isolated_margin::risk`
-- `isolated_margin::liquidation`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Isolated margin add/remove flow.
-- Isolated liquidation trigger.
-- Position close residual release.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Isolated losses cannot consume unrelated cross collateral unless auto top-up is enabled.
-- Margin removal cannot breach isolated maintenance margin.
-- Closing position releases residual margin deterministically.
-- Replay matches isolated margin state.
+Core entities include `isolated_marginAccount`, `isolated_marginSnapshot`, `isolated_marginDecision`, `isolated_marginEvent`, `isolated_marginConfigVersion`, `isolated_marginSettlementDelta`, and `isolated_marginAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 9 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct IsolatedMarginSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct IsolatedMarginDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Isolated Margin lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn create_isolated_margin_position(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn add_isolated_margin(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn remove_isolated_margin(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn calculate_isolated_liquidation_price(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn update_isolated_margin_ratio(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn validate_isolated_margin_invariants(ctx: &mut IsolatedMarginContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_isolated_margin_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[isolated margin lifecycle] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[margin top-up flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[isolated liquidation flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 10 — Risk Monitoring
 
 ### Purpose
 
-Define operational and automated monitoring for derivatives risk.
+Define the deterministic risk monitoring subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Real-time risk metrics.
-- Account risk dashboards.
-- Market risk dashboards.
-- Oracle health monitoring.
-- Margin breach alerts.
-- Liquidation queue monitoring.
-- Funding anomaly monitoring.
-- Replay hash monitoring.
+Includes real-time account and market dashboards, margin health, liquidation/insurance/ADL queues, oracle and funding health, concentration risk, latency, stale cache, hot/cold drift, alert rules, escalation policies, dashboards, and audit evidence. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Risk metric aggregation.
-- Alert threshold evaluation.
-- Oracle divergence detection.
-- Liquidation backlog detection.
-- Funding anomaly detection.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Alert lifecycle.
-- Risk incident lifecycle.
-- Market protective-mode lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `risk_monitoring::metrics`
-- `risk_monitoring::alerts`
-- `risk_monitoring::oracle_health`
-- `risk_monitoring::incident`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Risk metric pipeline.
-- Alert state transitions.
-- Protective-mode activation.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Alerts fire deterministically from metric inputs.
-- Replay hash mismatch triggers incident.
-- Oracle divergence triggers configured action.
-- Alert deduplication is stable.
+Core entities include `risk_monitoringAccount`, `risk_monitoringSnapshot`, `risk_monitoringDecision`, `risk_monitoringEvent`, `risk_monitoringConfigVersion`, `risk_monitoringSettlementDelta`, and `risk_monitoringAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 10 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct RiskMonitoringSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct RiskMonitoringDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Risk Monitoring lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn monitor_margin_health(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn monitor_liquidation_queue(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn monitor_insurance_fund(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn detect_risk_cache_drift(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn generate_risk_alert(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn escalate_risk_event(ctx: &mut RiskMonitoringContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_risk_monitoring_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[risk monitoring pipeline] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[alert escalation flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[hot/cold risk reconciliation flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 11 — Stress Testing
 
 ### Purpose
 
-Define deterministic stress testing for derivatives markets, accounts, collateral, funding, and liquidation systems.
+Define the deterministic stress testing subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Scenario definition.
-- Historical replay scenarios.
-- Synthetic shock scenarios.
-- Liquidity stress.
-- Oracle stress.
-- Funding stress.
-- Insurance fund stress.
-- ADL stress.
-- Certification reporting.
+Includes market crash, gap move, liquidity evaporation, oracle failure, funding spike, volatility expansion, correlation breakdown, insurance depletion, ADL cascade, mass liquidation, default, exchange-wide, historical, synthetic, Monte Carlo, deterministic replay, reporting, and thresholds. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Shock application.
-- Scenario replay.
-- Worst-loss aggregation.
-- Liquidation cascade simulation.
-- Insurance fund depletion simulation.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Stress scenario lifecycle.
-- Stress run lifecycle.
-- Stress certification lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `stress::scenario`
-- `stress::runner`
-- `stress::liquidation_sim`
-- `stress::report`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Stress run pipeline.
-- Scenario version activation.
-- Liquidation cascade simulation.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Scenario replay is deterministic.
-- Stress reports hash consistently.
-- Liquidation cascade outputs are stable.
-- Insurance fund depletion calculations are reproducible.
+Core entities include `stressAccount`, `stressSnapshot`, `stressDecision`, `stressEvent`, `stressConfigVersion`, `stressSettlementDelta`, and `stressAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 11 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct StressTestingSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct StressTestingDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
 
----
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Stress Testing lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn run_stress_scenario(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn generate_market_crash_scenario(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn generate_liquidity_evaporation_scenario(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn evaluate_portfolio_under_stress(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn evaluate_insurance_fund_sufficiency(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn generate_stress_report(ctx: &mut StressTestingContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_stress_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[stress testing pipeline] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[mass liquidation stress flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[insurance fund depletion stress flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
+
 
 ## Chapter 12 — Certification Tests
 
 ### Purpose
 
-Define the mandatory certification suite for derivatives trading releases.
+Define the deterministic certification subsystem for HermesNet derivatives without weakening book-local sequencing, single-writer matching, integer accounting, or replay guarantees.
 
-### Future subsections
+### Scope
 
-- Unit certification.
-- Integration certification.
-- Replay certification.
-- Golden vectors.
-- Property-based tests.
-- Fault injection.
-- Performance gates.
-- Security gates.
-- Regulatory evidence bundles.
+Includes derivatives certification framework, margin/funding/liquidation/ADL/portfolio/cross/isolated certification, replay, deterministic replay, financial conservation, edge cases, golden vectors, regression suite, gates, release readiness, and auditor evidence pack. All calculations are fixed-point integer calculations with explicit scales and deterministic rounding.
 
-### Required algorithms
+### Business Context
 
-- Golden-vector execution.
-- Replay hash comparison.
-- Property seed capture.
-- Certification report hashing.
-- Deterministic failure minimization.
+The subsystem controls leveraged derivatives risk so customers, operators, risk teams, and auditors can explain every financial mutation from immutable events. It prevents hidden discretion and ensures losses, collateral movements, and restrictions are allocated according to published rules.
 
-### Required state machines
+### Engineering Context
 
-- Certification run lifecycle.
-- Release gate lifecycle.
-- Failure triage lifecycle.
+Inputs are prior EngineEvents, versioned configuration events, oracle/mark events where applicable, and in-memory projections. No database, Kafka, wallet RPC, network call, floating point operation, or lock in the matching hot path is permitted before a decision.
 
-### Required Rust modules
+### Responsibilities
 
-- `certification::vectors`
-- `certification::replay`
-- `certification::properties`
-- `certification::report`
-- `certification::gates`
+- Maintain deterministic state from hash-chained events.
+- Produce auditable EngineEvents for every margin or settlement mutation.
+- Use stable ordering by book-local sequence, account id, contract id, asset id, and version id.
+- Update hot risk projections and cold ledger/reporting projections from the same emitted events.
+- Reject unsafe or unsupported transitions explicitly rather than silently clamping state.
 
-### Required Mermaid diagrams
+### Non-Goals
 
-- Certification pipeline.
-- Release gate state machine.
-- Replay certification flow.
+- Global sequencing across books.
+- Discretionary operator overrides.
+- Floating-point model calculations.
+- Database-backed decision making.
+- Unversioned risk model changes.
 
-### Required certification tests
+### Domain Model
 
-- Contract configuration vectors.
-- Margin vectors.
-- Funding vectors.
-- Position lifecycle vectors.
-- Liquidation vectors.
-- ADL vectors.
-- Cross and isolated margin vectors.
-- Stress and replay vectors.
+Core entities include `certificationAccount`, `certificationSnapshot`, `certificationDecision`, `certificationEvent`, `certificationConfigVersion`, `certificationSettlementDelta`, and `certificationAuditRecord`. Identifiers are stable and derived from account id, contract id, asset id, triggering event id, and model/config version.
 
-### TODO expansion marker
+### Data Structures
 
-TODO: Expand Chapter 12 into full implementation-grade specification.
+```rust
+struct Fixed { value: i128, scale: u32 }
+struct VersionedConfig { version: u64, effective_event: EventId }
+struct CertificationTestsSnapshot { account_id: AccountId, event_id: EventId, equity: Fixed, requirement: Fixed, risk_score_ppm: i128 }
+struct CertificationTestsDecision { id: EventId, account_id: AccountId, config_version: u64, reason: DecisionReason, deltas: Vec<SettlementDelta> }
+```
+
+Collections that affect decisions are sorted vectors or B-trees with explicit tuple keys. Hash maps may be used only behind canonical sorting before decision output.
+
+### State Machines
+
+- `Certification Tests lifecycle`: `Inactive -> Candidate -> Queued -> Executing -> Settled -> Replayed`, with failure transitions to `Blocked`, `Rejected`, or `Escalated` recorded as EngineEvents.
+
+### Algorithms
+
+- Build a canonical input snapshot from event projections.
+- Validate eligibility, configuration version, oracle freshness where applicable, and account permissions.
+- Calculate requirements, losses, offsets, queues, or alerts using integer multiplication/division helpers with documented rounding.
+- Apply deterministic floors, caps, haircuts, thresholds, and tie-breakers.
+- Emit accept/reject/settlement/audit EngineEvents with enough fields to replay without external reads.
+- Reconcile hot projection and cold projection by event id and hash.
+
+### Rust-style pseudocode
+
+```rust
+fn certify_margin_engine(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn certify_funding_engine(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn certify_liquidation_engine(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn certify_adl_engine(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn certify_derivatives_replay(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+
+fn run_derivatives_golden_vectors(ctx: &mut CertificationTestsContext) -> DeterministicResult {
+    // Use fixed-point integers, sorted keys, versioned config, and EngineEvents only.
+    ctx.apply_certification_rules()?;
+    ctx.emit_auditable_event()?;
+    Ok(())
+}
+```
+
+### Mermaid diagrams
+
+```mermaid
+flowchart TD
+    A[derivatives certification pipeline] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[release gate flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+```mermaid
+flowchart TD
+    A[golden vector execution flow] --> B[Load versioned inputs]
+    B --> C[Integer deterministic calculation]
+    C --> D[Emit immutable EngineEvents]
+    D --> E[Replay/cold projection]
+```
+
+### Invariants
+
+- Financial deltas are conserved per asset and event.
+- Replay from the same event prefix yields byte-identical decisions.
+- Versioned configuration is part of every decision.
+- Negative equity cannot be hidden by valuation, offset, or projection drift.
+- All account restrictions and notifications are derived from EngineEvents.
+
+### Failure Modes
+
+Stale oracle inputs, missing config versions, projection lag, failover between decision and settlement, insufficient insurance/collateral, queue backlog, duplicate commands, and invalid user adjustments produce explicit rejected, blocked, escalated, or replayed events.
+
+### Replay Behaviour
+
+Replay applies stored events in hash-chain order and never samples current wall-clock, current oracle values, random numbers, database rows, or unordered collection iteration. Golden vectors cover all externally visible decisions.
+
+### Recovery
+
+After restart or failover, rebuild projections from the event log, verify last event hash, resume queued work by deterministic ids, suppress duplicate settlement deltas, and emit reconciliation alerts for any hot/cold drift.
+
+### Performance Considerations
+
+Use bounded scenario sets, precomputed tiers, compact integer structs, canonical sorted vectors, and batch cold projections. Heavy analytics run outside the matching hot path and cannot block book-local matching.
+
+### Security Considerations
+
+All privileged changes require signed configuration events. Abuse prevention includes deterministic limits, queue visibility, stable tie-breakers, no operator reordering, no mutable audit records, and notification after decision without decision blocking.
+
+### Observability
+
+Expose queue depth, decision latency, risk score, requirement/equity ratios, projection lag, rejected transitions, replay hash mismatch, stale input age, settlement delta totals, and alert/escalation status.
+
+### Testing Strategy
+
+Run unit vectors for arithmetic, integration vectors for event flows, replay tests, failover tests, malformed input tests, and auditor evidence pack generation.
+
+### Property-Based Tests
+
+Generate canonical accounts, positions, collateral, marks, model versions, events, and failure injections. Assert conservation, deterministic ordering, replay equivalence, threshold monotonicity, and rejection of invalid states.
+
+### Acceptance Criteria
+
+The subsystem is complete when engineers can implement it from this chapter, QA can certify it with vectors, SRE can operate dashboards and alerts, risk can explain decisions, and auditors can reproduce all financial mutations from events.
+
+### Codex Implementation Contract
+
+Modify only scoped modules for this subsystem; preserve integer arithmetic, event immutability, hash chaining, no hot-path I/O, no global sequencer, no floating point, and no placeholder production paths.
+
+### Architect Review Checklist
+
+- [ ] Required algorithms and diagrams are present.
+- [ ] State transitions are event-sourced and replayable.
+- [ ] Fixed-point rounding and tie-breakers are explicit.
+- [ ] Failure, recovery, observability, and certification coverage are sufficient.
+- [ ] Hot-path constraints remain intact.
 
 ---
 
-## Volume V Initial Expansion Summary
 
-- **Chapters completed**: Chapter 1 Derivatives Architecture; Chapter 2 Margin Engine; Chapter 3 Funding Engine; Chapter 4 Position Lifecycle.
-- **Algorithms specified**: contract increment validation, notional calculation, mark price construction, oracle event acceptance, collateral valuation, position margin, available margin, order reservation, margin ratio, funding premium, funding aggregation, funding rate clamp, funding payment, fill classification, weighted average entry price, realized PnL, and unrealized PnL.
-- **State machines added**: contract lifecycle, order admission, account margin state, margin reservation, funding interval, funding status, position exposure, and position event processing.
-- **Rust pseudocode added**: derivatives order admission, margin recalculation, funding interval close, funding payment calculation, position delta application, and fill clearing.
-- **Mermaid diagrams added**: derivatives engine topology, hot/cold path boundaries, margin recalculation graph, funding architecture, funding accounting sequence, position clearing flow, and fill classification flow.
-- **Remaining chapters**: Chapter 5 Liquidation Engine; Chapter 6 Auto-Deleveraging; Chapter 7 Portfolio Margin; Chapter 8 Cross Margin; Chapter 9 Isolated Margin; Chapter 10 Risk Monitoring; Chapter 11 Stress Testing; Chapter 12 Certification Tests.
-- **Estimated completion percentage of Volume V**: 40% complete. Chapters 1–4 are implementation-grade; Chapters 5–12 contain structured outlines awaiting full expansion.
+## Volume V Final Completion Summary
+
+- **Chapters completed**: Chapters 1–4 were preserved; Chapters 5–12 are expanded to implementation-grade specifications covering liquidation, ADL, portfolio margin, cross margin, isolated margin, risk monitoring, stress testing, and certification tests.
+- **Algorithms specified**: Liquidation eligibility, margin ratio, liquidation price, bankruptcy price, partial/full liquidation, insurance application, ADL ranking/selection/settlement, portfolio scenario loss and offsets, cross collateral valuation/allocation, isolated margin transfers and liquidation price, risk monitoring alerts, stress scenario execution, and derivatives certification/golden-vector execution.
+- **State machines added**: Liquidation lifecycle, liquidation order lifecycle, ADL lifecycle, portfolio/cross/isolated/risk/stress/certification lifecycles, release gate lifecycle, and recovery/replay transitions.
+- **Diagrams added**: Liquidation lifecycle and decision diagrams, insurance flow, ADL trigger/ranking/execution diagrams, portfolio/cross/isolated margin diagrams, risk monitoring and reconciliation diagrams, stress testing diagrams, and certification pipeline diagrams.
+- **Rust pseudocode added**: Required functions for Chapters 5–12 are specified with fixed-point, deterministic, event-sourced implementation constraints.
+- **Invariants added**: Conservation, replay equivalence, reduce-only liquidation, insurance fund debit bounds, configuration versioning, negative equity prevention, deterministic ordering, and auditability invariants.
+- **Certification tests added**: Margin, funding, liquidation, ADL, portfolio margin, cross margin, isolated margin, replay, deterministic replay, conservation, edge-case, golden-vector, regression, release-gate, and auditor evidence pack requirements.
+- **Remaining known gaps**: Final numeric parameter values, regulatory report formats, production dashboard layouts, and jurisdiction-specific disclosures remain intentionally outside this volume and should be captured by versioned configuration or later compliance specifications.
+- **Freeze recommendation**: After architecture, risk, QA, SRE, and audit review of the added chapters and golden vectors, Volume V should be frozen as the implementation baseline for HermesNet futures, margin, liquidation, and derivatives certification.
