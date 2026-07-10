@@ -18,6 +18,7 @@
 ## Major implementation areas covered
 
 - Rust workspace and crate architecture.
+- Gateway ingress is now implementation-ready: REST, WebSocket, FIX, OUCH, SBE boundaries, authentication, authorization, API keys, JWT, HMAC, rate limits, idempotency, session lifecycle, router admission, private streams, `ENGINE_BUSY`, replay awareness, observability, shutdown/restart, tests, and benchmarks.
 - Gateway ingress is implementation-ready for REST, WebSocket, FIX, OUCH, SBE boundaries, authentication, authorization, API keys, JWT, HMAC, rate limits, idempotency, sessions, private streams, router backpressure, `ENGINE_BUSY`, observability, shutdown, recovery, testing, and benchmarking.
 - Single-writer Book Core runtime, memory layout, event append-before-success, snapshots, replay, deterministic recovery, and unsafe-code policy.
 - Risk reservations, spot/futures holds, credit buckets, duplicate client order behavior, reconciliation, and replay reconstruction.
@@ -44,4 +45,4 @@
 
 ## Next recommended phase
 
-Start implementation with `hermes-fixed`, `hermes-ids`, `hermes-domain`, and `hermes-events`, then build the Book Core skeleton and replay harness before gateway, wallet, derivatives, market data, and deployment integration.
+Start implementation with `hermes-fixed`, `hermes-ids`, `hermes-domain`, and `hermes-events`, then build the Book Core skeleton and replay harness; the Gateway handbook is ready for `hermes-gateway` and `hermes-connectivity` crate implementation after those foundations are available.
