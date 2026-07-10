@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This master index coordinates the HermesNet Implementation Handbook. It defines the implementation philosophy, the volume map, the dependency order, and the review gates for converting HES into a Rust implementation.
+This master index coordinates the completed HermesNet Implementation Handbook. It defines the implementation philosophy, complete volume map, dependency order, and review gates for converting HES into Rust implementation work.
 
 ## Implementation philosophy
 
@@ -12,76 +12,60 @@ HermesNet is implemented as deterministic Rust systems software. The hot path is
 
 | Volume | Title | Status |
 |---|---|---|
-| HIH-001 | Rust Workspace & Crate Architecture | Expanded |
-| HIH-002 | Gateway Implementation | Outline |
-| HIH-003 | Book Core Implementation | Outline |
-| HIH-004 | Risk & Reservation Implementation | Outline |
-| HIH-005 | Clearing & Event Log Implementation | Outline |
-| HIH-006 | Wallet & Ledger Implementation | Outline |
-| HIH-007 | Futures & Liquidation Implementation | Outline |
-| HIH-008 | Market Data & Connectivity Implementation | Outline |
-| HIH-009 | Testing & Benchmarking Implementation | Outline |
-| HIH-010 | Deployment & Operations Implementation | Outline |
+| HIH-001 | Rust Workspace & Crate Architecture | Complete |
+| HIH-002 | Gateway Implementation | Complete |
+| HIH-003 | Book Core Implementation | Complete |
+| HIH-004 | Risk & Reservation Implementation | Complete |
+| HIH-005 | Clearing & Event Log Implementation | Complete |
+| HIH-006 | Wallet & Ledger Implementation | Complete |
+| HIH-007 | Futures & Liquidation Implementation | Complete |
+| HIH-008 | Market Data & Connectivity Implementation | Complete |
+| HIH-009 | Testing & Benchmarking Implementation | Complete |
+| HIH-010 | Deployment & Operations Implementation | Complete |
 
 ## Implementation order
 
-1. `hermes-fixed`
-2. `hermes-ids`
-3. `hermes-domain`
-4. `hermes-events`
-5. `hermes-book`
-6. `hermes-matching`
-7. `hermes-risk`
-8. `hermes-clearing`
-9. `hermes-replay`
-10. `hermes-gateway`
-11. `hermes-wallet` and `hermes-ledger`
-12. `hermes-futures`
-13. `hermes-market-data` and `hermes-connectivity`
-14. `hermes-tests`, benchmarks, deployment packaging
+1. Foundation: `hermes-fixed`, `hermes-ids`, `hermes-domain`.
+2. Event substrate: `hermes-events`, event serialization, hash chain, replay compatibility.
+3. Hot-path book: `hermes-book`, `hermes-matching`, book-local sequence, single-writer loop, arenas, pools, snapshots.
+4. Risk and settlement path: `hermes-risk`, `hermes-clearing`, reservation lifecycle, clearing deltas, ledger deltas.
+5. Replay certification: `hermes-replay`, snapshot restore, deterministic equivalence tests.
+6. Gateway and connectivity ingress: `hermes-gateway`, `hermes-auth`, `hermes-rate-limit`, `hermes-connectivity`.
+7. Wallet and ledger services: `hermes-wallet`, `hermes-ledger`, `hermes-treasury`, `hermes-compliance`.
+8. Derivatives: `hermes-futures`, `hermes-margin`, `hermes-liquidation`, `hermes-oracle`.
+9. Market data and external protocols: `hermes-market-data`, `hermes-fix`, `hermes-sbe`, drop copy.
+10. Test and benchmark infrastructure: `hermes-tests`, `hermes-benches`, `hermes-fixtures`, `hermes-golden-vectors`.
+11. Deployment and operations: `hermes-config`, `hermes-observability`, `hermes-admin`, manifests, scripts, runbooks.
 
 ## Dependency map
 
-Foundational crates (`fixed`, `ids`, `domain`, `events`) must not depend on application crates. Hot-path crates depend only downward. Cold-path adapters depend on hot-path APIs, never the reverse.
+- Foundational crates (`fixed`, `ids`, `domain`) have no dependency on application crates.
+- `hermes-events` depends on foundational types and is consumed by hot-path and projection crates.
+- `hermes-book` owns the single-writer runtime and depends downward on matching, risk traits, clearing traits, events, fixed, and IDs.
+- `hermes-risk` and `hermes-clearing` depend on domain/fixed/events and expose pure deterministic contracts to Book Core.
+- `hermes-replay` depends on events plus deterministic apply contracts; runtime crates must remain replayable without DB/Kafka.
+- Gateway/connectivity crates depend on domain/events and router contracts but hot-path crates do not depend on network protocols.
+- Wallet/ledger/futures/market-data consume durable events and journals; they do not mutate Book Core state directly.
+- Test/benchmark crates may depend broadly but must not become production dependencies.
+- Deployment crates/scripts configure and supervise binaries; they must not change deterministic engine semantics.
 
 ## Crate map summary
 
-See `crate-map/crate-map.md` for crate ownership, hot/cold classification, forbidden dependencies, and dependency direction.
+See `crate-map/crate-map.md` for crate ownership, hot/cold classification, forbidden dependencies, and dependency direction. The completed HIH volumes provide the implementation contracts that expand that map.
 
 ## Relationship to HES volumes
 
 HES remains the source of truth for externally observable behavior. HIH volumes translate HES requirements into Rust implementation design without adding new system obligations.
-
-## Rust toolchain assumptions
-
-- Stable Rust by default.
-- MSRV is set intentionally when the workspace is created.
-- `cargo fmt`, `cargo clippy`, `cargo test`, property tests, replay tests, and criterion-style benchmarks are expected.
-- Nightly-only features require explicit review and must not be required for production builds.
-
-## Build philosophy
-
-Builds should be reproducible, feature-gated, and minimal. Release hot-path builds should enable deterministic optimizations and forbid accidental debug assertions that alter timing-sensitive behavior.
-
-## Testing philosophy
-
-Use layered testing: unit tests for arithmetic and IDs, property tests for matching and replay, integration tests for gateway-to-event flow, and differential replay tests for event log recovery.
-
-## Benchmark philosophy
-
-Benchmarks must measure book-local throughput, tail latency, allocation counts, queue pressure, and replay speed. Benchmarks are not correctness substitutes.
 
 ## Review gates
 
 - Fixed-point arithmetic audit.
 - ID serialization audit.
 - Event schema and hash-chain audit.
-- Matching determinism audit.
+- Matching determinism and single-writer audit.
 - Risk reservation atomicity audit.
-- Replay equivalence audit.
-- Hot-path allocation audit.
-- Dependency audit.
-
-## Remaining HIH work
-
-Expand HIH-002 through HIH-010 after HIH-001 is accepted, keeping each expansion constrained to implementation guidance and HES alignment.
+- Clearing, wallet, and ledger double-entry audit.
+- Replay equivalence and golden-vector certification.
+- Gateway security and overload audit.
+- Market-data sequence/checksum audit.
+- Deployment recovery and rollback audit.
