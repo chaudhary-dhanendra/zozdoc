@@ -46,3 +46,5 @@
 ## Next recommended phase
 
 Start implementation with `hermes-fixed`, `hermes-ids`, `hermes-domain`, and `hermes-events`, then build the Book Core skeleton and replay harness; the Gateway handbook is ready for `hermes-gateway` and `hermes-connectivity` crate implementation after those foundations are available.
+
+Gateway documentation has been normalized after merge resolution: duplicate retained sections in HIH-002, the Gateway module contract, and the Gateway request-flow example were consolidated into single authoritative sections while preserving the detailed technical requirements, protocol semantics, lifecycle behavior, security rules, replay interpretation, and validation expectations.
