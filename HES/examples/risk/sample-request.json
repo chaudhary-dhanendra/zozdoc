@@ -1,0 +1,7 @@
+{
+  "request_id": "req_rsk_0001",
+  "account_id": "acct_trader_201",
+  "asset": "USDT",
+  "reserve_units": 105000000000,
+  "reason": "spot_limit_buy"
+}

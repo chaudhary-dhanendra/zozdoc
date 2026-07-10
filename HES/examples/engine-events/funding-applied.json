@@ -1,0 +1,18 @@
+{
+  "event_id": "evt_20260115_funding_applied_000011",
+  "event_type": "FUNDING_APPLIED",
+  "request_id": "req_20260115_000011",
+  "correlation_id": "corr_20260115_000011",
+  "previous_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "event_hash": "0x1212121212121212121212121212121212121212121212121212121212121212",
+  "payload": {
+    "account_id": "acct_fixture_001",
+    "asset": "USDT",
+    "amount_units": 1000000000,
+    "reason": "funding_applied"
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "schema_version": "hes.engine_event.v1",
+  "book_id": "SPOT-BTC-USDT",
+  "book_seq": 11
+}

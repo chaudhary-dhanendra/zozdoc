@@ -1,0 +1,15 @@
+{
+  "event_id": "evt_20260115_reservation_created_000001",
+  "event_type": "RESERVATION_CREATED",
+  "request_id": "req_20260115_000001",
+  "correlation_id": "corr_20260115_000001",
+  "previous_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "event_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+  "payload": {
+    "reservation_id": "rsv_201_0001",
+    "asset": "USDT",
+    "amount_units": 105000000000
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "schema_version": "hes.engine_event.v1"
+}

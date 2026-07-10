@@ -1,0 +1,10 @@
+{
+  "replay_id": "replay_fixture_0001",
+  "input_snapshot_seq": 7000,
+  "last_event_seq": 7002,
+  "reconstructed_state_hash": "0x7272727272727272727272727272727272727272727272727272727272727272",
+  "expected_state_hash": "0x7272727272727272727272727272727272727272727272727272727272727272",
+  "hash_chain_verified": true,
+  "replay_equivalent": true,
+  "divergences": []
+}

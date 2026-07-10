@@ -1,0 +1,19 @@
+{
+  "event_id": "evt_20260115_liquidation_triggered_005001",
+  "event_type": "LIQUIDATION_TRIGGERED",
+  "request_id": "req_20260115_005001",
+  "correlation_id": "corr_20260115_005001",
+  "previous_hash": "0x5001500150015001500150015001500150015001500150015001500150015001",
+  "event_hash": "0x5002500250025002500250025002500250025002500250025002500250025002",
+  "payload": {
+    "account_id": "acct_fut_099",
+    "symbol": "BTC-PERP",
+    "margin_ratio_bps": 420,
+    "maintenance_bps": 500,
+    "max_contracts": 4
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "schema_version": "hes.engine_event.v1",
+  "book_id": "SPOT-BTC-USDT",
+  "book_seq": 5001
+}

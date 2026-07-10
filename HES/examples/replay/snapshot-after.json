@@ -1,0 +1,17 @@
+{
+  "book_id": "SPOT-BTC-USDT",
+  "book_seq": 7002,
+  "bids": [
+    {
+      "price_quote_units": 4200000000000,
+      "quantity_base_units": 5000000
+    }
+  ],
+  "asks": [
+    {
+      "price_quote_units": 4210000000000,
+      "quantity_base_units": 2000000
+    }
+  ],
+  "state_hash": "0x7272727272727272727272727272727272727272727272727272727272727272"
+}
