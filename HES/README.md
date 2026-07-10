@@ -84,3 +84,15 @@ DOCX and PDF files are generated artifacts, not the source of truth. The Markdow
 ## Recommended Next Task
 
 Create ADR and RFC templates, add a requirements traceability matrix template, and add automated Markdown, link, and Mermaid validation without modifying technical volumes.
+
+## Repository Refinement Additions
+
+The repository also includes maintainability assets for enterprise specification work:
+
+- `templates/` — copy-ready templates for chapters, ADRs, RFCs, algorithms, state machines, sequence diagrams, review checklists, test matrices, and Codex implementation contracts.
+- `reference/` — concise engineer-facing reference guides for exchange overview, gateway, book core, risk, wallet-ledger, derivatives, market data, operations, security, and testing.
+- `GLOSSARY.md` — canonical HermesNet terminology for architecture, trading, accounting, derivatives, connectivity, operations, security, and quality engineering.
+- `ARCHITECTURE_PRINCIPLES.md` — repository-level architecture principles, including book-local ordering, single-writer book core, deterministic replay, event sourcing, hash-chained logs, bounded queues, and operational recoverability.
+- `METADATA_STANDARD.md` — required metadata header and lifecycle status values for future controlled documents.
+- `ADR/ADR-0001-*.md` through `ADR/ADR-0020-*.md` — draft ADR placeholders for core HermesNet architectural decisions. These placeholders do not remove or replace ADR material that remains in Volume I.
+- `RFC/RFC-0001-example.md` — example RFC showing the official proposal format and review fields.
