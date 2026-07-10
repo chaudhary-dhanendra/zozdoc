@@ -6,27 +6,42 @@ Draft
 
 ## Context
 
-TODO: Summarize the problem, constraints, and production forces that require this decision.
+Placeholder for migrated production context from the related HES volume.
 
 ## Decision
 
-TODO: State the selected architecture decision in precise, testable language.
+Placeholder for the precise architectural decision to be migrated without changing frozen volume semantics.
 
 ## Alternatives Considered
 
-- TODO: Alternative 1 and reason rejected.
-- TODO: Alternative 2 and reason rejected.
+- Preserve current behavior until implementation evidence is available.
+- Migrate decision text directly from the source volume in a controlled ADR pass.
 
 ## Consequences
 
-- TODO: Positive consequences.
-- TODO: Negative or constraining consequences.
-- TODO: Operational and migration consequences.
+- Keeps ADR numbering stable for implementation traceability.
+- Requires future migration before the ADR can become accepted.
 
-## Related HES Volumes
+## Performance Impact
 
-TODO: Link related HES volumes and sections.
+To be quantified during ADR migration and implementation benchmarking.
 
-## Migration Note
+## Security Impact
 
-TODO: migrate full ADR content from HES-001 Volume I.md
+To be assessed during ADR migration against gateway, wallet, ledger, and operations controls.
+
+## Operational Impact
+
+To be assessed during ADR migration against deployment, replay, monitoring, and incident-response requirements.
+
+## Related HES Volume
+
+HES-001 Volume I.md
+
+## Related Requirements
+
+See `requirements/REQUIREMENTS_INDEX.md` for candidate requirement mappings.
+
+## Migration TODO
+
+Migrate full ADR rationale, alternatives, and acceptance evidence from HES-001 Volume I.md without rewriting frozen volume prose.

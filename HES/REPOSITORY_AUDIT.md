@@ -104,3 +104,13 @@ Create ADR and RFC templates, add a requirements traceability matrix template, a
 - Add a requirements traceability matrix using the new test matrix template.
 - Add ownership metadata to existing controlled documents.
 - Add CI evidence collection for release certification and production-readiness gates.
+
+## Final Practical Artifact Completion Pass
+
+- Added domain examples for spot, futures, options, wallet, ledger, gateway, market data, risk, liquidation, and replay.
+- Added 15 golden vectors covering order, risk, wallet, derivatives, liquidation, ledger, and replay scenarios.
+- Added 15 reference EngineEvent samples with hash-chain fields and schema versions.
+- Added replay sample fixtures for before-state, event stream, after-state, and replay result.
+- Added `requirements/REQUIREMENTS_INDEX.md` with 112 concise requirements across required prefixes.
+- Improved ADR placeholders with performance, security, operational, requirement, and migration sections.
+- Remaining recommended future work: migrate full ADR rationale, bind requirements to executable tests, add schema validation CI, and port fixtures into HIH/HAT implementation repositories.

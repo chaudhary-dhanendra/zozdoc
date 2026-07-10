@@ -1,0 +1,10 @@
+{
+  "request_id": "req_opt_0001",
+  "account_id": "acct_opt_012",
+  "symbol": "BTC-20260327-50000-C",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "premium_quote_units": 135000000000,
+  "quantity_contracts": 1,
+  "time_in_force": "IOC"
+}

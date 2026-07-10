@@ -1,0 +1,85 @@
+{
+  "test_id": "GV-0001",
+  "purpose": "spot limit full fill",
+  "inputs": {
+    "request_id": "req_gv_0001",
+    "account_id": "acct_fixture_001",
+    "symbol": "BTC-USDT",
+    "fixed_point_scale": 100000000
+  },
+  "expected_engine_events": [
+    {
+      "event_id": "evt_20260115_order_accepted_000001",
+      "event_type": "ORDER_ACCEPTED",
+      "request_id": "req_20260115_000001",
+      "correlation_id": "corr_20260115_000001",
+      "previous_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "event_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "payload": {
+        "fixture": "spot-limit-full-fill"
+      },
+      "created_at": "2026-01-15T12:00:00Z",
+      "schema_version": "hes.engine_event.v1",
+      "book_id": "SPOT-BTC-USDT",
+      "book_seq": 1
+    }
+  ],
+  "expected_balances": [
+    {
+      "account_id": "acct_fixture_001",
+      "asset": "USDT",
+      "available_units": 999999999000,
+      "reserved_units": 1000
+    }
+  ],
+  "expected_positions": [
+    {
+      "account_id": "acct_fixture_001",
+      "symbol": "BTC-PERP",
+      "contracts": 0,
+      "entry_price_quote_units": 4210000000000
+    }
+  ],
+  "expected_order_book": {
+    "book_id": "SPOT-BTC-USDT",
+    "last_seq": 1,
+    "bids": [
+      {
+        "price_quote_units": 4210000000000,
+        "quantity_base_units": 1000000
+      }
+    ],
+    "asks": [
+      {
+        "price_quote_units": 4212500000000,
+        "quantity_base_units": 2000000
+      }
+    ]
+  },
+  "expected_ledger_entries": [
+    {
+      "ledger_entry_id": "led_gv_0001_001",
+      "account_id": "acct_fixture_001",
+      "asset": "USDT",
+      "delta_units": -1000
+    },
+    {
+      "ledger_entry_id": "led_gv_0001_002",
+      "account_id": "exchange_clearing",
+      "asset": "USDT",
+      "delta_units": 1000
+    }
+  ],
+  "expected_hash_chain": {
+    "start_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "end_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "event_count": 1,
+    "verified": true
+  },
+  "invariants_verified": [
+    "fixed_point_only",
+    "book_sequence_monotonic",
+    "ledger_entries_balance",
+    "hash_chain_contiguous"
+  ]
+}

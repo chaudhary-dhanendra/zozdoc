@@ -1,0 +1,17 @@
+{
+  "event_id": "evt_20260115_deposit_credited_000001",
+  "event_type": "DEPOSIT_CREDITED",
+  "request_id": "req_20260115_000001",
+  "correlation_id": "corr_20260115_000001",
+  "previous_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "event_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+  "payload": {
+    "account_id": "acct_user_101",
+    "asset": "BTC",
+    "amount_base_units": 15000000,
+    "chain": "bitcoin",
+    "tx_id": "btc_tx_8f14e45fceea167a5a36dedd4bea2543"
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "schema_version": "hes.engine_event.v1"
+}

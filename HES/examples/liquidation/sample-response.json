@@ -1,0 +1,6 @@
+{
+  "liquidation_id": "liq_0001",
+  "account_id": "acct_fut_099",
+  "status": "PARTIAL_EXECUTED",
+  "contracts_liquidated": 4
+}

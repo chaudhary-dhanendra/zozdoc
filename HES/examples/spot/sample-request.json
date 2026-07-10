@@ -1,0 +1,11 @@
+{
+  "request_id": "req_spot_0001",
+  "account_id": "acct_mm_001",
+  "client_order_id": "cli_spot_buy_001",
+  "symbol": "BTC-USDT",
+  "side": "BUY",
+  "order_type": "LIMIT",
+  "price_quote_units": 4212500000000,
+  "quantity_base_units": 2500000,
+  "time_in_force": "GTC"
+}

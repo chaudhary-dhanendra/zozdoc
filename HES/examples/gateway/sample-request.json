@@ -1,0 +1,10 @@
+{
+  "request_id": "req_gwy_0001",
+  "api_key_id": "key_prod_017",
+  "client_order_id": "cli_017_0001",
+  "symbol": "ETH-USDT",
+  "side": "SELL",
+  "order_type": "LIMIT",
+  "price_quote_units": 310500000000,
+  "quantity_base_units": 1200000000
+}

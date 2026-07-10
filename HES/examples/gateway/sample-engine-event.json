@@ -1,0 +1,16 @@
+{
+  "event_id": "evt_20260115_order_accepted_004001",
+  "event_type": "ORDER_ACCEPTED",
+  "request_id": "req_20260115_004001",
+  "correlation_id": "corr_20260115_004001",
+  "previous_hash": "0x4001400140014001400140014001400140014001400140014001400140014001",
+  "event_hash": "0x4002400240024002400240024002400240024002400240024002400240024002",
+  "payload": {
+    "order_id": "ord_eth_0001",
+    "dedupe_key": "key_prod_017:cli_017_0001"
+  },
+  "created_at": "2026-01-15T12:00:00Z",
+  "schema_version": "hes.engine_event.v1",
+  "book_id": "SPOT-BTC-USDT",
+  "book_seq": 4001
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "event_id": "evt_20260115_order_accepted_007001",
+    "event_type": "ORDER_ACCEPTED",
+    "request_id": "req_20260115_007001",
+    "correlation_id": "corr_20260115_007001",
+    "previous_hash": "0x7001700170017001700170017001700170017001700170017001700170017001",
+    "event_hash": "0x7002700270027002700270027002700270027002700270027002700270027002",
+    "payload": {
+      "order_id": "ord_replay_001",
+      "side": "BUY",
+      "price_quote_units": 4210000000000,
+      "quantity_base_units": 1000000
+    },
+    "created_at": "2026-01-15T12:00:00Z",
+    "schema_version": "hes.engine_event.v1",
+    "book_id": "SPOT-BTC-USDT",
+    "book_seq": 7001
+  },
+  {
+    "event_id": "evt_20260115_trade_executed_007002",
+    "event_type": "TRADE_EXECUTED",
+    "request_id": "req_20260115_007002",
+    "correlation_id": "corr_20260115_007002",
+    "previous_hash": "0x7002700270027002700270027002700270027002700270027002700270027002",
+    "event_hash": "0x7003700370037003700370037003700370037003700370037003700370037003",
+    "payload": {
+      "maker_order_id": "ord_ask_seed",
+      "taker_order_id": "ord_replay_001",
+      "price_quote_units": 4210000000000,
+      "quantity_base_units": 1000000
+    },
+    "created_at": "2026-01-15T12:00:00Z",
+    "schema_version": "hes.engine_event.v1",
+    "book_id": "SPOT-BTC-USDT",
+    "book_seq": 7002
+  }
+]
